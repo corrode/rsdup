@@ -7,14 +7,14 @@ cargo install --path .
 rsdup src
 ```
 
-The default `near-miss` mode finds exact clones plus statement sequences that differ in at most two conservatively selected nested expression subtrees. Each differing subtree becomes a `$1`, `$2`, and similar syntax hole. Whole statements, top-level callees, nested calls, control flow, assignments, `.await`, `?`, macros, and attributes cannot become holes, keeping the default conservative. Use `--mode exact` for the original exact structural matcher or change the budget with `--max-holes`.
+The default `near-miss` mode finds exact clones plus statement sequences that differ in at most one conservatively selected nested expression subtree. Each differing subtree becomes a `$1`, `$2`, and similar syntax hole. Whole statements, top-level callees, nested calls, control flow, assignments, `.await`, `?`, macros, and attributes cannot become holes, keeping the default conservative. Use `--mode exact` for the original exact structural matcher or change the budget with `--max-holes`.
 
 The default `balanced` profile ignores whitespace and comments, alpha-renames unambiguous local variables, and normalizes literal values while preserving their kind. Function names, method names, field names, types, paths, operators, control flow, and macro contents remain semantic anchors outside explicit near-miss holes. Use `--profile strict` to preserve identifiers and literal values unless they occur inside a syntax hole.
 
 ```console
 rsdup . --min-tokens 40 --min-lines 5
 rsdup . --mode exact
-rsdup . --max-holes 1
+rsdup . --max-holes 2
 rsdup src tests --profile strict
 rsdup . --ignore-tests
 rsdup . --exclude 'generated/**' --exclude 'vendor/**'
@@ -24,7 +24,7 @@ rsdup . --format json
 rsdup . --fail-on-duplicates
 ```
 
-Directory scans honor `.gitignore`, `.ignore`, and global Git excludes. The `.git` and `target` directories are always skipped. Explicit `.rs` file arguments are scanned even when ignored.
+Directory scans honor `.gitignore`, `.ignore`, global Git excludes, and hidden-path conventions. This prevents nested agent or Git workspaces such as `.workspace/`, `.worktrees/`, and `.claude/worktrees/` from being scanned as extra copies of the project. The `.git` and `target` directories are always skipped. Explicit files or hidden directories passed as input paths are still scanned.
 
 Pass `--exclude <GLOB>` more than once to omit multiple paths. Patterns are matched against paths relative to each scan root and to the current directory, so `--exclude 'generated/**' --exclude 'fixtures/*.rs'` works with relative or absolute input directories. Unlike ignore files, explicit `--exclude` patterns also apply to `.rs` files named directly on the command line.
 

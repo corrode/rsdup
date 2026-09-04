@@ -43,7 +43,7 @@ mod tests {
                 min_lines: 1,
                 profile,
                 mode: DetectionMode::Exact,
-                max_holes: 2,
+                max_holes: 1,
                 ignore_tests: false,
                 sort: SortOrder::Occurrences,
             },

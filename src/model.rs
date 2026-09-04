@@ -44,7 +44,7 @@ impl Default for Options {
             min_lines: 5,
             profile: Profile::Balanced,
             mode: DetectionMode::NearMiss,
-            max_holes: 2,
+            max_holes: 1,
             ignore_tests: false,
             sort: SortOrder::Occurrences,
         }

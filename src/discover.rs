@@ -36,7 +36,7 @@ pub fn discover(paths: &[PathBuf], options: &DiscoverOptions) -> Result<Vec<Path
 
         let mut builder = WalkBuilder::new(&input);
         builder
-            .hidden(false)
+            .hidden(true)
             .git_ignore(!options.no_ignore)
             .git_global(!options.no_ignore)
             .git_exclude(!options.no_ignore)
@@ -191,5 +191,33 @@ mod tests {
         .unwrap();
 
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn hidden_workspace_directories_are_not_scanned_from_their_parent() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("src/lib.rs");
+        let workspace_copy = root.path().join(".workspace/checkout/src/lib.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(workspace_copy.parent().unwrap()).unwrap();
+        fs::write(&source, "fn production() {}").unwrap();
+        fs::write(&workspace_copy, "fn copied_checkout() {}").unwrap();
+
+        let files = discover(&[root.path().to_path_buf()], &DiscoverOptions::default()).unwrap();
+
+        assert_eq!(files, vec![source.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn explicitly_named_hidden_workspace_directories_can_be_scanned() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join(".workspace");
+        let source = workspace.join("src/lib.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn explicit() {}").unwrap();
+
+        let files = discover(&[workspace], &DiscoverOptions::default()).unwrap();
+
+        assert_eq!(files, vec![source.canonicalize().unwrap()]);
     }
 }

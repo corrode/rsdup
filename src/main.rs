@@ -37,7 +37,7 @@ struct Cli {
     mode: ModeArg,
 
     /// Maximum syntax holes in a near-miss clone.
-    #[arg(long, default_value_t = 2, value_parser = positive_usize)]
+    #[arg(long, default_value_t = 1, value_parser = positive_usize)]
     max_holes: usize,
 
     /// Output format.
@@ -344,7 +344,7 @@ mod tests {
 
         assert_eq!(cli.exclude, ["generated/**", "vendor/**"]);
         assert!(matches!(cli.mode, ModeArg::NearMiss));
-        assert_eq!(cli.max_holes, 2);
+        assert_eq!(cli.max_holes, 1);
     }
 
     #[test]
