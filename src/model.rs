@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use serde::Serialize;
 
@@ -81,6 +81,29 @@ pub struct CloneClass {
     pub syntax_template: String,
 }
 
+impl fmt::Display for CloneClass {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.holes == 0 {
+            "duplicate"
+        } else {
+            "near duplicate"
+        };
+        write!(
+            formatter,
+            "{kind} {}: {} anchored tokens, {} lines, {} occurrences",
+            self.id,
+            self.tokens,
+            self.lines,
+            self.occurrences.len()
+        )?;
+        match self.holes {
+            0 => Ok(()),
+            1 => write!(formatter, ", 1 syntax hole"),
+            holes => write!(formatter, ", {holes} syntax holes"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Summary {
     pub files: usize,
@@ -93,4 +116,40 @@ pub struct Report {
     pub schema_version: u32,
     pub summary: Summary,
     pub clones: Vec<CloneClass>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CloneClass;
+
+    fn clone_class(holes: usize) -> CloneClass {
+        CloneClass {
+            id: "abc123".to_owned(),
+            tokens: 42,
+            lines: 7,
+            holes,
+            occurrences: Vec::new(),
+            syntax_template: String::new(),
+        }
+    }
+
+    #[test]
+    fn exact_clone_display_has_no_hole_suffix() {
+        assert_eq!(
+            clone_class(0).to_string(),
+            "duplicate abc123: 42 anchored tokens, 7 lines, 0 occurrences"
+        );
+    }
+
+    #[test]
+    fn near_clone_display_pluralizes_holes() {
+        assert_eq!(
+            clone_class(1).to_string(),
+            "near duplicate abc123: 42 anchored tokens, 7 lines, 0 occurrences, 1 syntax hole"
+        );
+        assert_eq!(
+            clone_class(2).to_string(),
+            "near duplicate abc123: 42 anchored tokens, 7 lines, 0 occurrences, 2 syntax holes"
+        );
+    }
 }

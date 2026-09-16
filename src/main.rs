@@ -214,16 +214,7 @@ fn print_syntax(mut output: impl Write, report: &Report, colored_output: bool) -
     }
 
     for clone in &report.clones {
-        writeln!(
-            output,
-            "{} {}: {} anchored tokens, {} lines, {} occurrences{}",
-            clone_kind(clone.holes),
-            clone.id,
-            clone.tokens,
-            clone.lines,
-            clone.occurrences.len(),
-            hole_suffix(clone.holes)
-        )?;
+        writeln!(output, "{clone}")?;
         writeln!(output, "  syntax:")?;
         let highlighted = highlight_rust(&clone.syntax_template, colored_output)?;
         for line in highlighted.lines() {
@@ -266,22 +257,6 @@ fn highlight_rust(source: &str, colored_output: bool) -> Result<String> {
     Ok(highlighted)
 }
 
-fn clone_kind(holes: usize) -> &'static str {
-    if holes == 0 {
-        "duplicate"
-    } else {
-        "near duplicate"
-    }
-}
-
-fn hole_suffix(holes: usize) -> String {
-    match holes {
-        0 => String::new(),
-        1 => ", 1 syntax hole".to_owned(),
-        holes => format!(", {holes} syntax holes"),
-    }
-}
-
 fn print_text(mut output: impl Write, report: &Report) -> io::Result<()> {
     if report.clones.is_empty() {
         writeln!(
@@ -293,16 +268,7 @@ fn print_text(mut output: impl Write, report: &Report) -> io::Result<()> {
     }
 
     for clone in &report.clones {
-        writeln!(
-            output,
-            "{} {}: {} anchored tokens, {} lines, {} occurrences{}",
-            clone_kind(clone.holes),
-            clone.id,
-            clone.tokens,
-            clone.lines,
-            clone.occurrences.len(),
-            hole_suffix(clone.holes)
-        )?;
+        writeln!(output, "{clone}")?;
         for occurrence in &clone.occurrences {
             writeln!(
                 output,
