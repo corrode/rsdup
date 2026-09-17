@@ -45,7 +45,7 @@ impl Default for Options {
             profile: Profile::Balanced,
             mode: DetectionMode::NearMiss,
             max_holes: 1,
-            ignore_tests: false,
+            ignore_tests: true,
             sort: SortOrder::Occurrences,
         }
     }
@@ -62,6 +62,9 @@ pub struct Occurrence {
     pub path: PathBuf,
     pub start: Position,
     pub end: Position,
+    /// Original source captured during scanning; excluded from the syntax JSON schema.
+    #[serde(skip)]
+    pub source: String,
     #[serde(skip)]
     pub(crate) file_id: usize,
     #[serde(skip)]

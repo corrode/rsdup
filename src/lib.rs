@@ -1,6 +1,8 @@
 mod detect;
 mod discover;
 mod model;
+pub mod ollama;
+pub mod semantic;
 mod syntax;
 
 use std::path::PathBuf;
@@ -20,6 +22,18 @@ pub fn scan(
     let paths = discover::discover(paths, discover_options)?;
     let sources = discover::read_sources(&paths)?;
     analyze_sources(sources, options)
+}
+
+/// Scan body-level similarity candidates without changing syntax clone detection.
+pub fn scan_semantic(
+    paths: &[PathBuf],
+    options: &semantic::SemanticOptions,
+    discover_options: &DiscoverOptions,
+    embedder: &mut impl semantic::Embedder,
+) -> Result<semantic::SemanticReport> {
+    options.validate()?;
+    let paths = discover::discover(paths, discover_options)?;
+    semantic::analyze(discover::read_sources(&paths)?, options, embedder)
 }
 
 pub fn analyze_sources(sources: Vec<(PathBuf, String)>, options: &Options) -> Result<Report> {
@@ -434,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn ignore_tests_excludes_cfg_test_modules() {
+    fn tests_are_excluded_by_default_and_can_be_included() {
         let source = "#[cfg(test)] mod tests { fn duplicate() { let value = fixture(); process(value); finish(value); } }";
         let report = analyze_sources(
             vec![
@@ -451,6 +465,9 @@ mod tests {
         .unwrap();
 
         assert!(report.clones.is_empty());
+        assert!(Options::default().ignore_tests);
+        let included = analyze(source, source, Profile::Strict);
+        assert!(!included.clones.is_empty());
     }
 
     #[test]
@@ -499,6 +516,48 @@ mod tests {
 
         assert_eq!(report.summary.files, 0);
         assert!(report.clones.is_empty());
+    }
+
+    #[test]
+    fn nested_test_directories_are_excluded_in_both_syntax_modes() {
+        for mode in [DetectionMode::Exact, DetectionMode::NearMiss] {
+            for directory in ["src/adapters/test", "src/adapters/tests"] {
+                let source = "fn a() { let value = fixture(); process(value); finish(value); }";
+                let sources = vec![
+                    (
+                        PathBuf::from(format!("{directory}/left.rs")),
+                        source.to_owned(),
+                    ),
+                    (
+                        PathBuf::from(format!("{directory}/right.rs")),
+                        source.to_owned(),
+                    ),
+                ];
+                let mut options = Options {
+                    min_tokens: 8,
+                    min_lines: 1,
+                    mode,
+                    ..Default::default()
+                };
+                let excluded = analyze_sources(sources.clone(), &options).unwrap();
+                assert_eq!(excluded.summary.files, 0);
+                assert!(excluded.clones.is_empty());
+                options.ignore_tests = false;
+                assert!(
+                    !analyze_sources(sources, &options)
+                        .unwrap()
+                        .clones
+                        .is_empty()
+                );
+            }
+        }
+        for path in [
+            "src/test_utils/input.rs",
+            "src/contest/input.rs",
+            "src/latest.rs",
+        ] {
+            assert!(!super::syntax::is_test_file(Path::new(path)));
+        }
     }
 
     #[test]

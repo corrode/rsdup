@@ -42,10 +42,20 @@ pub(crate) fn detect(files: &[ParsedFile], containers: &[Container], options: &O
         return empty_report(files.len());
     }
 
-    match options.mode {
+    let mut report = match options.mode {
         DetectionMode::Exact => detect_exact(files, containers, options),
         DetectionMode::NearMiss => detect_near_misses(files, containers, options),
+    };
+    // Snapshot only retained occurrences, not the much larger candidate set.
+    for occurrence in report
+        .clones
+        .iter_mut()
+        .flat_map(|clone| &mut clone.occurrences)
+    {
+        occurrence.source =
+            files[occurrence.file_id].source[occurrence.byte_start..occurrence.byte_end].to_owned();
     }
+    report
 }
 
 fn detect_exact(files: &[ParsedFile], containers: &[Container], options: &Options) -> Report {
@@ -678,6 +688,7 @@ fn occurrence(file: &ParsedFile, file_id: usize, start: usize, end: usize) -> Oc
         path: file.path.clone(),
         start: position(file, start),
         end: position(file, end),
+        source: String::new(),
         file_id,
         byte_start: start,
         byte_end: end,
@@ -849,6 +860,7 @@ mod tests {
                         line: index + 1,
                         column: 2,
                     },
+                    source: String::new(),
                     file_id: index,
                     byte_start: index,
                     byte_end: index + 1,

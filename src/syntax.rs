@@ -101,10 +101,10 @@ pub(crate) fn parse_sources(
     Ok((files, containers))
 }
 
-fn is_test_file(path: &Path) -> bool {
+pub(crate) fn is_test_file(path: &Path) -> bool {
     let in_tests_directory = path
         .iter()
-        .any(|component| component.to_string_lossy() == "tests");
+        .any(|component| component == "test" || component == "tests");
     let test_filename = path.file_stem().is_some_and(|stem| {
         let stem = stem.to_string_lossy();
         stem == "test" || stem == "tests" || stem.ends_with("_test")
@@ -119,13 +119,13 @@ fn is_test_block(block: &ast::BlockExpr) -> bool {
         .any(|node| has_test_attribute(&node))
 }
 
-fn has_test_attribute(node: &SyntaxNode) -> bool {
+pub(crate) fn has_test_attribute(node: &SyntaxNode) -> bool {
     node.children()
         .filter(|child| child.kind() == SyntaxKind::ATTR)
         .any(|attribute| is_test_attribute(&attribute))
 }
 
-fn contains_test_attribute(node: &SyntaxNode) -> bool {
+pub(crate) fn contains_test_attribute(node: &SyntaxNode) -> bool {
     node.descendants()
         .filter(|descendant| descendant.kind() == SyntaxKind::ATTR)
         .any(|attribute| is_test_attribute(&attribute))
@@ -160,7 +160,7 @@ fn is_test_attribute(attribute: &SyntaxNode) -> bool {
     ) || leaf.ends_with("_test")
 }
 
-fn parse_source(path: &Path, source: &str) -> Result<ast::SourceFile> {
+pub(crate) fn parse_source(path: &Path, source: &str) -> Result<ast::SourceFile> {
     let mut best_errors = Vec::new();
     for edition in [
         Edition::Edition2024,
