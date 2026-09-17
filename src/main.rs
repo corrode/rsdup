@@ -1,5 +1,6 @@
 mod editor;
 mod snippet_diff;
+mod theme;
 mod tui;
 mod tui_data;
 
@@ -80,6 +81,14 @@ struct Cli {
     /// Editor command for the interactive browser (then VISUAL, EDITOR, or zed).
     #[arg(long, value_name = "COMMAND")]
     editor: Option<String>,
+
+    /// TUI color theme (default: dracula). See --list-themes; t/T cycles in the browser.
+    #[arg(long, value_name = "NAME")]
+    theme: Option<theme::ThemeName>,
+
+    /// List available TUI themes without scanning or connecting to Ollama.
+    #[arg(long, exclusive = true)]
+    list_themes: bool,
 
     /// Syntax modes only: how duplicate classes are ordered.
     #[arg(long, value_enum, default_value_t = SortArg::Occurrences, conflicts_with = "embedding_model")]
@@ -184,6 +193,10 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
 fn run() -> Result<ExitCode> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
+    if cli.list_themes {
+        print_themes(io::stdout().lock())?;
+        return Ok(ExitCode::SUCCESS);
+    }
     validate_mode_options(&cli, &matches)?;
     if cli.quiet && matches!(cli.format, Format::Json) {
         bail!("--quiet cannot be combined with --format json");
@@ -244,7 +257,11 @@ fn run() -> Result<ExitCode> {
         } else {
             "near-miss"
         };
-        tui::run(tui_data::syntax(&report, mode), cli.editor.as_deref())?;
+        tui::run(
+            tui_data::syntax(&report, mode),
+            cli.editor.as_deref(),
+            cli.theme.unwrap_or_default(),
+        )?;
     } else if !cli.quiet {
         let stdout = io::stdout();
         let colored_output = stdout.is_terminal();
@@ -269,12 +286,32 @@ fn run() -> Result<ExitCode> {
     }
 }
 
+fn print_themes(mut output: impl Write) -> io::Result<()> {
+    for &theme in theme::ThemeName::all() {
+        writeln!(
+            output,
+            "{:<20} {}{}",
+            theme.slug(),
+            theme.display_name(),
+            if theme == theme::ThemeName::default() {
+                " (default)"
+            } else {
+                ""
+            }
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_interactive(cli: &Cli) -> Result<()> {
     if cli.view == View::Interactive && cli.quiet {
         bail!("--quiet cannot be combined with --view interactive");
     }
     if cli.editor.is_some() && cli.view != View::Interactive {
         bail!("--editor only applies to --view interactive");
+    }
+    if cli.theme.is_some() && cli.view != View::Interactive {
+        bail!("--theme only applies to --view interactive");
     }
     Ok(())
 }
@@ -320,7 +357,11 @@ fn run_semantic(cli: &Cli) -> Result<ExitCode> {
     let report = rsdup::scan_semantic(&cli.paths, &options, &discovery, &mut embedder)?;
     embedder.verify_model()?;
     if cli.view == View::Interactive {
-        tui::run(tui_data::semantic(&report), cli.editor.as_deref())?;
+        tui::run(
+            tui_data::semantic(&report),
+            cli.editor.as_deref(),
+            cli.theme.unwrap_or_default(),
+        )?;
     } else if !cli.quiet {
         let stdout = io::stdout();
         let colored = stdout.is_terminal();
@@ -1039,6 +1080,41 @@ mod tests {
             assert!(help.contains("--mode near-miss"));
             assert!(help.contains("--profile strict"));
         }
+    }
+
+    #[test]
+    fn cli_themes_use_the_library_catalog() {
+        for &name in crate::theme::ThemeName::all() {
+            let cli =
+                Cli::try_parse_from(["rsdup", "--view", "interactive", "--theme", name.slug()])
+                    .unwrap();
+            assert_eq!(cli.theme, Some(name));
+            super::validate_interactive(&cli).unwrap();
+        }
+        let cli = Cli::try_parse_from(["rsdup", "--view", "interactive"]).unwrap();
+        assert_eq!(
+            cli.theme.unwrap_or_default(),
+            crate::theme::ThemeName::Dracula
+        );
+        assert!(Cli::try_parse_from(["rsdup", "--theme", "nonexistent-theme"]).is_err());
+        let cli = Cli::try_parse_from(["rsdup", "--theme", "nord"]).unwrap();
+        assert!(
+            super::validate_interactive(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("--theme")
+        );
+        let cli = Cli::try_parse_from(["rsdup", "--list-themes"]).unwrap();
+        assert!(cli.list_themes);
+        assert!(Cli::try_parse_from(["rsdup", ".", "--list-themes"]).is_err());
+        let mut output = Vec::new();
+        super::print_themes(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), crate::theme::ThemeName::all().len());
+        for &name in crate::theme::ThemeName::all() {
+            assert!(output.contains(name.slug()));
+        }
+        assert!(output.contains("(default)"));
     }
 
     #[test]

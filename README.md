@@ -74,6 +74,7 @@ Views only affect text output. Syntax JSON schema version 2 includes a `holes` c
 ```console
 rsdup . --view interactive
 rsdup . --view interactive --editor 'zed --wait'
+rsdup . --view interactive --theme catppuccin-mocha
 rsdup . --mode near-miss --view interactive
 ```
 
@@ -89,12 +90,15 @@ The diff compares exact text, including whitespace and line endings—not normal
 | `Tab`, `h` / `l` | Switch between match-list and source focus |
 | `n` / `p`, `]` / `[` | Next / previous occurrence and comparison pair in the selected group |
 | `d` | Toggle difference highlighting (on by default) |
+| `t` / `T` | Next / previous color theme |
 | `PgUp` / `PgDn`, `g` / `G` | Page or jump to the beginning/end of the focused pane |
 | `H` / `L`, `Shift-Left` / `Shift-Right` | Scroll source horizontally; line numbers stay fixed |
 | `/` | Filter groups by function name or path; Enter keeps the filter, Esc clears it |
 | `Enter` / `o` | Open the focused occurrence in your editor |
 | `?` | Show keyboard help |
 | `q` / `Ctrl-C` | Quit |
+
+Themes come from [`ratatui-themes`](https://docs.rs/ratatui-themes/latest/ratatui_themes/), including Dracula (the default), Nord, Catppuccin, Gruvbox, Tokyo Night, and Solarized. Run `rsdup --list-themes` for the full catalog; this does not scan files or contact Ollama. Choose with `--theme NAME`, or cycle with `t`/`T` while browsing. The active theme appears in the header. Palettes apply throughout the browser, including syntax highlighting, dimmed context, and diff tints. Switching preserves your selection and scroll position and recolors cached source without rereading files or requesting embeddings. Theme changes are session-only; pass `--theme` again to reuse a favorite. This option only affects the interactive view, not text or JSON reports.
 
 Editor selection uses `--editor`, then `VISUAL`, then `EDITOR`, falling back to `zed`. Zed, VS Code/Code Insiders/VSCodium, Vim/Neovim/Vi, Emacs/emacsclient, and Nano receive the source location; other executables receive the file path only. Commands support quoted arguments but are executed directly, without shell expansion. Use an editor-specific wait option if you want the browser to wait for a GUI editing session. Terminal editors temporarily take over the terminal; the browser resumes afterward, including after launch failures.
 

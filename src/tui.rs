@@ -1,4 +1,4 @@
-//! Interactive, read-only match browser. Source is tokenized once, never during drawing.
+//! Interactive, read-only match browser. Source is tokenized on theme changes, never during drawing.
 
 use std::{
     collections::HashMap,
@@ -20,41 +20,27 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
 use crate::{
     snippet_diff::{LineChange, SnippetDiff},
+    theme::{Theme, ThemeName},
     tui_data::{BrowserReport, Snippet},
 };
-
-const BG: Color = Color::Rgb(18, 22, 31);
-const PANEL: Color = Color::Rgb(25, 30, 41);
-const FG: Color = Color::Rgb(218, 226, 239);
-const MUTED: Color = Color::Rgb(143, 157, 180);
-const BORDER: Color = Color::Rgb(64, 76, 96);
-const ACCENT: Color = Color::Rgb(105, 211, 200);
-const KEYWORD: Color = Color::Rgb(192, 156, 245);
-const STRING: Color = Color::Rgb(166, 211, 139);
-const NUMBER: Color = Color::Rgb(240, 183, 126);
-const FUNCTION: Color = Color::Rgb(128, 190, 247);
-const ERROR: Color = Color::Rgb(245, 151, 150);
-const REMOVED_BG: Color = Color::Rgb(65, 35, 43);
-const ADDED_BG: Color = Color::Rgb(29, 57, 45);
-const CHANGED_BG: Color = Color::Rgb(61, 51, 32);
 
 type Highlighted = Vec<Line<'static>>;
 
 /// Browse cached source context without reading files or modifying the report.
-pub(crate) fn run(report: BrowserReport, editor: Option<&str>) -> Result<()> {
+pub(crate) fn run(report: BrowserReport, editor: Option<&str>, theme: ThemeName) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
             "the match browser requires an interactive terminal on stdin and stdout; run without piping or redirection, or use a non-interactive output mode"
         );
     }
-    let mut app = App::new(report);
+    let mut app = App::new(report, theme);
 
     // Restore before the normal panic diagnostic is printed. Catching the unwind lets
     // us put back the *original* hook outside an unwinding thread, even on setup failure.
@@ -213,6 +199,8 @@ struct PairDiff {
 }
 
 struct App {
+    theme_name: ThemeName,
+    theme: Theme,
     diff_enabled: bool,
     pair_diff: Option<PairDiff>,
     report: BrowserReport,
@@ -235,25 +223,9 @@ struct App {
 }
 
 impl App {
-    fn new(report: BrowserReport) -> Self {
-        let mut cache: HashMap<Arc<str>, Arc<Highlighted>> = HashMap::new();
-        let highlighted = report
-            .groups
-            .iter()
-            .map(|group| {
-                group
-                    .occurrences
-                    .iter()
-                    .map(|snippet| {
-                        Arc::clone(
-                            cache
-                                .entry(Arc::clone(&snippet.display_source))
-                                .or_insert_with(|| Arc::new(highlight(&snippet.display_source))),
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
+    fn new(report: BrowserReport, theme_name: ThemeName) -> Self {
+        let theme = Theme::new(theme_name);
+        let highlighted = highlight_report(&report, &theme);
         let search_text = report
             .groups
             .iter()
@@ -270,6 +242,8 @@ impl App {
             .collect();
         let visible = (0..report.groups.len()).collect();
         let mut app = Self {
+            theme_name,
+            theme,
             diff_enabled: true,
             pair_diff: None,
             report,
@@ -293,6 +267,12 @@ impl App {
         app.reset_scroll();
         app.refresh_diff();
         app
+    }
+
+    fn set_theme(&mut self, name: ThemeName) {
+        self.theme_name = name;
+        self.theme = Theme::new(name);
+        self.highlighted = highlight_report(&self.report, &self.theme);
     }
 
     // Cache only the displayed pair, never all O(n²) pairs of a large group.
@@ -447,6 +427,8 @@ impl App {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('d') => self.diff_enabled = !self.diff_enabled,
+            KeyCode::Char('t') => self.set_theme(self.theme_name.next()),
+            KeyCode::Char('T') => self.set_theme(self.theme_name.prev()),
             KeyCode::Char('/') => self.searching = true,
             KeyCode::Esc => {
                 self.query.clear();
@@ -552,7 +534,28 @@ fn initial_scroll(snippet: &Snippet, page: usize) -> usize {
         .saturating_sub(3.min(page.saturating_sub(1)))
 }
 
-fn highlight(source: &str) -> Highlighted {
+fn highlight_report(report: &BrowserReport, theme: &Theme) -> Vec<Vec<Arc<Highlighted>>> {
+    let mut cache: HashMap<Arc<str>, Arc<Highlighted>> = HashMap::new();
+    report
+        .groups
+        .iter()
+        .map(|group| {
+            group
+                .occurrences
+                .iter()
+                .map(|snippet| {
+                    Arc::clone(
+                        cache
+                            .entry(Arc::clone(&snippet.display_source))
+                            .or_insert_with(|| Arc::new(highlight(&snippet.display_source, theme))),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn highlight(source: &str, theme: &Theme) -> Highlighted {
     let parsed = SourceFile::parse(source, Edition::CURRENT);
     let tokens: Vec<_> = parsed
         .tree()
@@ -564,7 +567,7 @@ fn highlight(source: &str) -> Highlighted {
     for (index, token) in tokens.iter().enumerate() {
         let kind = token.kind();
         let color = if kind == SyntaxKind::COMMENT {
-            MUTED
+            theme.comment
         } else if matches!(
             kind,
             SyntaxKind::STRING
@@ -573,20 +576,20 @@ fn highlight(source: &str) -> Highlighted {
                 | SyntaxKind::CHAR
                 | SyntaxKind::BYTE
         ) {
-            STRING
+            theme.string
         } else if matches!(kind, SyntaxKind::INT_NUMBER | SyntaxKind::FLOAT_NUMBER) {
-            NUMBER
+            theme.number
         } else if kind.is_keyword(Edition::CURRENT) {
-            KEYWORD
+            theme.keyword
         } else if kind == SyntaxKind::IDENT
             && tokens[index + 1..]
                 .iter()
                 .find(|next| !matches!(next.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))
                 .is_some_and(|next| next.text() == "(")
         {
-            FUNCTION
+            theme.function
         } else {
-            FG
+            theme.foreground
         };
         // Splitting *after* lexing preserves multiline raw strings and comments.
         for (part_index, part) in token.text().split('\n').enumerate() {
@@ -609,27 +612,28 @@ fn highlight(source: &str) -> Highlighted {
     lines
 }
 
-fn panel(title: impl Into<Line<'static>>, active: bool) -> Block<'static> {
+fn panel(theme: &Theme, title: impl Into<Line<'static>>, active: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(if active { ACCENT } else { BORDER }))
-        .style(Style::default().bg(PANEL).fg(FG))
+        .border_style(if active { theme.accent } else { theme.border })
+        .style(theme.panel)
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
+    frame.render_widget(Block::default().style(app.theme.base), area);
     if area.width < 60 || area.height < 12 {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled("rsdup · match browser", Style::default().fg(ACCENT)),
+                Line::styled("rsdup · match browser", app.theme.accent),
                 Line::from("Enlarge terminal to at least 60 × 12."),
                 Line::from(format!(
                     "{} matches · {} files",
                     app.report.groups.len(),
                     app.report.files
                 )),
+                Line::from(format!("{} · t/T theme", app.theme_name.display_name())),
                 Line::from("q / Ctrl-C quit · ? help"),
             ]),
             area,
@@ -647,11 +651,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled(
-                    " rsdup ",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("/ {} / match browser", app.report.mode)),
+                Span::styled(" rsdup ", app.theme.accent.add_modifier(Modifier::BOLD)),
+                Span::raw(format!(
+                    "/ {} / match browser · {}",
+                    app.report.mode,
+                    app.theme_name.display_name()
+                )),
             ]),
             Line::styled(
                 format!(
@@ -659,7 +664,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     app.report.groups.len(),
                     app.report.files
                 ),
-                Style::default().fg(MUTED),
+                app.theme.muted,
             ),
         ]),
         rows[0],
@@ -675,7 +680,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_code(frame, app, columns[1]);
     draw_footer(frame, app, rows[2]);
     if app.help {
-        draw_help(frame, area);
+        draw_help(frame, &app.theme, area);
     }
 }
 
@@ -693,7 +698,7 @@ fn draw_groups(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(format!("{:>3}  {}", index + 1, group.title)),
                 Line::styled(
                     format!("     {} occurrences", group.occurrences.len()),
-                    Style::default().fg(MUTED),
+                    app.theme.muted,
                 ),
             ])
         })
@@ -701,6 +706,7 @@ fn draw_groups(frame: &mut Frame, app: &mut App, area: Rect) {
     app.list
         .select((!app.visible.is_empty()).then_some(app.selected));
     let block = panel(
+        &app.theme,
         format!(
             " Matches {}/{} ",
             app.visible.len(),
@@ -722,12 +728,7 @@ fn draw_groups(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_stateful_widget(
             List::new(items)
                 .block(block)
-                .highlight_style(
-                    Style::default()
-                        .bg(Color::Rgb(42, 66, 78))
-                        .fg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                )
+                .highlight_style(app.theme.selection)
                 .highlight_symbol("▸"),
             area,
             &mut app.list,
@@ -738,7 +739,8 @@ fn draw_groups(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(group_index) = app.group_index() else {
         frame.render_widget(
-            Paragraph::new("Select a match, or press / to search.").block(panel(" Source ", false)),
+            Paragraph::new("Select a match, or press / to search.")
+                .block(panel(&app.theme, " Source ", false)),
             area,
         );
         return;
@@ -747,7 +749,8 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
     let count = group.occurrences.len();
     if count == 0 {
         frame.render_widget(
-            Paragraph::new("This group has no occurrences.").block(panel(" Source ", false)),
+            Paragraph::new("This group has no occurrences.")
+                .block(panel(&app.theme, " Source ", false)),
             area,
         );
         return;
@@ -765,12 +768,9 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
                     app.occurrence + 1,
                     count
                 ),
-                Style::default().fg(ACCENT),
+                app.theme.accent,
             ),
-            Line::styled(
-                format!(" {}", group.description),
-                Style::default().fg(MUTED),
-            ),
+            Line::styled(format!(" {}", group.description), app.theme.muted),
         ]),
         rows[0],
     );
@@ -880,6 +880,7 @@ fn draw_card(
         initial_scroll(snippet, page).min(lines.len().saturating_sub(page))
     };
     let block = panel(
+        &app.theme,
         format!(
             " {}#{} {} ",
             if focused { "▸ " } else { "" },
@@ -901,11 +902,11 @@ fn draw_card(
         .split(inner);
     frame.render_widget(
         Paragraph::new(display_location(snippet, app.cwd.as_deref(), rows[0].width))
-            .style(Style::default().fg(FUNCTION)),
+            .style(app.theme.location),
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new(evidence(app, group, occurrence)).style(Style::default().fg(ACCENT)),
+        Paragraph::new(evidence(app, group, occurrence)).style(app.theme.accent),
         rows[1],
     );
     let context = if snippet.test_context {
@@ -922,11 +923,11 @@ fn draw_card(
         )
     };
     frame.render_widget(
-        Paragraph::new(info).style(Style::default().fg(if snippet.warning.is_some() {
-            NUMBER
+        Paragraph::new(info).style(if snippet.warning.is_some() {
+            app.theme.warning
         } else {
-            MUTED
-        })),
+            app.theme.muted
+        }),
         rows[2],
     );
     let digits = snippet
@@ -973,44 +974,52 @@ fn draw_card(
             .copied()
             .unwrap_or(LineChange::Equal);
         match change {
-            LineChange::Equal => ('│', PANEL),
-            LineChange::Removed => ('−', REMOVED_BG),
-            LineChange::Added => ('+', ADDED_BG),
-            LineChange::Changed => (changes.map_or('│', |(_, marker)| marker), CHANGED_BG),
+            LineChange::Equal => (
+                '│',
+                Style {
+                    bg: app.theme.panel.bg,
+                    ..Style::default()
+                },
+                app.theme.gutter,
+            ),
+            LineChange::Removed => ('−', app.theme.removed.row, app.theme.removed.gutter),
+            LineChange::Added => ('+', app.theme.added.row, app.theme.added.gutter),
+            LineChange::Changed => (
+                changes.map_or('│', |(_, marker)| marker),
+                app.theme.changed.row,
+                app.theme.changed.gutter,
+            ),
         }
     };
     let numbers: Vec<_> = visible
         .clone()
         .map(|(index, _)| {
-            let (marker, bg) = decoration(index);
+            let (marker, _, gutter_style) = decoration(index);
             Line::styled(
                 format!(
                     "{:>digits$} {marker} ",
                     snippet.display_start_line.saturating_add(index)
                 ),
-                Style::default().bg(bg),
+                gutter_style,
             )
         })
         .collect();
     let source: Vec<_> = visible
         .map(|(index, line)| {
             let mut line = line.clone();
-            line.style = line.style.bg(decoration(index).1);
+            line.style = decoration(index).1;
             // Context is line-based: boundary lines retain syntax even when the
             // matched item starts or ends mid-line. Override token colors too.
             if match_index(index).is_none() {
-                line.style = line.style.fg(MUTED);
+                line.style = app.theme.context;
                 for span in &mut line.spans {
-                    span.style = span.style.fg(MUTED);
+                    span.style = app.theme.context;
                 }
             }
             line
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(numbers).style(Style::default().fg(MUTED)),
-        gutter,
-    );
+    frame.render_widget(Paragraph::new(numbers).style(app.theme.gutter), gutter);
     // Ratatui scrolls styled graphemes in terminal columns, not UTF-8 bytes.
     // Keeping the gutter separate preserves line numbers at every offset.
     frame.render_widget(
@@ -1023,9 +1032,9 @@ fn draw_card(
         .take(usize::from(code.height))
         .enumerate()
     {
-        let mut style = Style::default().bg(decoration(index).1);
+        let mut style = decoration(index).1;
         if match_index(index).is_none() {
-            style = style.fg(MUTED);
+            style = app.theme.context;
         }
         frame
             .buffer_mut()
@@ -1082,25 +1091,26 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(vec![
             Line::styled(
                 message,
-                Style::default().fg(
-                    if app.status.as_ref().is_some_and(|(error, _)| *error) && !app.searching {
-                        ERROR
-                    } else {
-                        ACCENT
-                    },
-                ),
+                if app.status.as_ref().is_some_and(|(error, _)| *error) && !app.searching {
+                    app.theme.error
+                } else {
+                    app.theme.accent
+                },
             ),
             Line::from(diff_legend(app)),
             Line::styled(
-                " Tab focus · n/p pair · H/L pan · Enter open · ? help · q quit",
-                Style::default().fg(MUTED),
+                format!(
+                    " t/T {} · Tab focus · n/p pair · H/L pan · Enter open · ? help · q quit",
+                    app.theme_name.display_name()
+                ),
+                app.theme.muted,
             ),
         ]),
         area,
     );
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
     let width = area.width.min(68);
     let height = area.height.min(20);
     let popup = Rect::new(
@@ -1118,6 +1128,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Line::from("H/L / Shift-←→      Pan source by 4 columns (code focus)"),
             Line::from("n/p / ] [           Next / previous occurrence (wraps)"),
             Line::from("d                   Toggle exact-text diff (default on)"),
+            Line::from("t/T                 Next / previous theme"),
             Line::from("PgUp / PgDn         Page in the focused pane"),
             Line::from("g/G / Home/End      First / last match or source page"),
             Line::from("Context dimmed by line; matched lines keep syntax and diff."),
@@ -1126,14 +1137,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Line::from("Esc                 Clear filter / cancel search"),
             Line::from("Enter / o           Open focused occurrence in editor"),
             Line::from("q / Ctrl-C          Quit (Ctrl-C also during search)"),
-            Line::from("Amber ±: changed; LIMIT: conservative marks (work cap)"),
+            Line::from("±: changed; LIMIT: conservative marks (work cap)"),
             Line::styled(
                 "Pair evidence is not a semantic equivalence claim.",
-                Style::default().fg(MUTED),
+                theme.muted,
             ),
             Line::from("Esc / ? / Enter     Close help"),
         ])
-        .block(panel(" Browser controls ", true)),
+        .block(panel(theme, " Browser controls ", true)),
         popup,
     );
 }
@@ -1142,8 +1153,176 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::tui_data::{MatchGroup, PairEvidence};
-    use ratatui::backend::TestBackend;
+    use ratatui::{backend::TestBackend, style::Color};
     use std::path::PathBuf;
+
+    fn dracula() -> Theme {
+        Theme::new(ThemeName::Dracula)
+    }
+
+    fn dracula_diff_background(bg: Color) -> bool {
+        [
+            dracula().added.row.bg,
+            dracula().removed.row.bg,
+            dracula().changed.row.bg,
+        ]
+        .contains(&Some(bg))
+    }
+
+    fn assert_readable(buffer: &ratatui::buffer::Buffer, name: ThemeName) {
+        let palette = name.palette();
+        let theme = Theme::new(name);
+        let foregrounds = [
+            palette.fg,
+            palette.muted,
+            palette.accent,
+            palette.secondary,
+            palette.error,
+            palette.warning,
+            palette.success,
+            palette.info,
+        ];
+        let backgrounds = [
+            palette.bg,
+            palette.selection,
+            theme.removed.row.bg.unwrap(),
+            theme.added.row.bg.unwrap(),
+            theme.changed.row.bg.unwrap(),
+        ];
+        for cell in &buffer.content {
+            assert!(foregrounds.contains(&cell.fg), "{name:?}: {cell:?}");
+            assert!(backgrounds.contains(&cell.bg), "{name:?}: {cell:?}");
+            if !cell.symbol().trim().is_empty() {
+                assert_ne!(cell.fg, cell.bg, "{name:?}: {cell:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn themes_cover_source_context_diff_selection_help_and_small_screens() {
+        for &name in ThemeName::all() {
+            let mut app = App::new(context_report(), name);
+            let cache = Arc::clone(&app.highlighted[0][0]);
+            for (width, height) in [(1, 1), (20, 6), (59, 20), (60, 12), (100, 24), (160, 48)] {
+                for help in [false, true] {
+                    app.help = help;
+                    assert_readable(&render(&mut app, width, height).1, name);
+                }
+            }
+            app.help = false;
+            app.focus = Focus::Code;
+            app.horizontal = 4;
+            assert_readable(&render(&mut app, 100, 24).1, name);
+            press(&mut app, KeyCode::Char('d'));
+            assert_readable(&render(&mut app, 160, 48).1, name);
+            assert!(Arc::ptr_eq(&cache, &app.highlighted[0][0]));
+            app.status = Some((true, "Editor failed".into()));
+            app.report.groups[0].occurrences[0].warning = Some("source missing".into());
+            assert_readable(&render(&mut app, 100, 24).1, name);
+            app.searching = true;
+            app.query = "missing".into();
+            app.filter();
+            assert_readable(&render(&mut app, 100, 24).1, name);
+            let mut empty_report = context_report();
+            empty_report.groups.clear();
+            let mut app = App::new(empty_report, name);
+            let (text, buffer) = render(&mut app, 100, 24);
+            assert!(text.contains("No matches in"));
+            assert_readable(&buffer, name);
+        }
+    }
+
+    #[test]
+    fn cycling_themes_preserves_navigation_diff_filter_and_shared_context() {
+        let mut app = App::new(context_report(), ThemeName::default());
+        app.query = "parsers".into();
+        app.filter();
+        render(&mut app, 160, 48);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('d'));
+        app.status = Some((false, "unchanged".into()));
+        let state = (
+            app.visible.clone(),
+            app.selected,
+            app.occurrence,
+            app.scroll,
+            app.match_scroll_anchored,
+            app.horizontal,
+            app.focus,
+            app.query.clone(),
+            app.diff_enabled,
+            app.list,
+            app.status.clone(),
+        );
+        let pair = app.pair_diff.as_ref().unwrap().diff.left.as_ptr();
+        let original = Arc::clone(&app.highlighted[0][0]);
+        for code in [KeyCode::Char('t'), KeyCode::Char('T')] {
+            for _ in ThemeName::all() {
+                let expected = if code == KeyCode::Char('t') {
+                    app.theme_name.next()
+                } else {
+                    app.theme_name.prev()
+                };
+                press(&mut app, code);
+                assert_eq!(app.theme_name, expected);
+                assert_eq!(
+                    state,
+                    (
+                        app.visible.clone(),
+                        app.selected,
+                        app.occurrence,
+                        app.scroll,
+                        app.match_scroll_anchored,
+                        app.horizontal,
+                        app.focus,
+                        app.query.clone(),
+                        app.diff_enabled,
+                        app.list,
+                        app.status.clone(),
+                    )
+                );
+                assert!(!app.searching);
+                assert_eq!(app.pair_diff.as_ref().unwrap().diff.left.as_ptr(), pair);
+                assert!(Arc::ptr_eq(&app.highlighted[0][0], &app.highlighted[0][1]));
+                assert_eq!(
+                    app.highlighted[0][0][0].spans[0].style.fg,
+                    Some(app.theme.keyword)
+                );
+                assert_eq!(
+                    app.highlighted[0][0][0].to_string(),
+                    original[0].to_string()
+                );
+                let cache = Arc::clone(&app.highlighted[0][0]);
+                let (text, buffer) = render(&mut app, 160, 48);
+                assert!(text.contains(app.theme_name.display_name()));
+                assert_readable(&buffer, expected);
+                assert!(Arc::ptr_eq(&cache, &app.highlighted[0][0]));
+            }
+            assert_eq!(app.theme_name, ThemeName::default());
+        }
+        assert!(!Arc::ptr_eq(&original, &app.highlighted[0][0]));
+        press(&mut app, KeyCode::Char('?'));
+        let cache = Arc::clone(&app.highlighted[0][0]);
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('T'));
+        assert!(app.help);
+        assert!(
+            render(&mut app, 160, 48)
+                .0
+                .contains("Next / previous theme")
+        );
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('T'));
+        assert!(app.searching);
+        assert_eq!(app.query, "parserstT");
+        assert_eq!(app.theme_name, ThemeName::default());
+        assert!(Arc::ptr_eq(&cache, &app.highlighted[0][0]));
+    }
 
     fn report() -> BrowserReport {
         BrowserReport {
@@ -1245,7 +1424,7 @@ mod tests {
 
     #[test]
     fn default_cards_show_dim_context_and_diff_only_on_matched_lines() {
-        let mut app = App::new(context_report());
+        let mut app = App::new(context_report(), ThemeName::Dracula);
         let (text, buffer) = render(&mut app, 160, 48);
         for expected in [
             "  7 │ fn line_7",
@@ -1277,9 +1456,15 @@ mod tests {
                 .position(|cells| cells[0].symbol() == "f" && cells[1].symbol() == "n")
                 .unwrap();
             let end = row.iter().rposition(|c| c.symbol() == "}").unwrap();
-            assert!(row[code..=end].iter().all(|c| c.fg == MUTED));
             assert!(
-                row[code..=end].iter().all(|c| c.bg == PANEL),
+                row[code..=end]
+                    .iter()
+                    .all(|c| c.fg == dracula().muted.fg.unwrap())
+            );
+            assert!(
+                row[code..=end]
+                    .iter()
+                    .all(|c| c.bg == dracula().panel.bg.unwrap()),
                 "context line {n}: {:?}",
                 &row[code..=end]
             );
@@ -1288,22 +1473,25 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .any(|c| c.fg == KEYWORD && c.bg == CHANGED_BG)
+                .any(|c| c.fg == dracula().keyword && c.bg == dracula().changed.row.bg.unwrap())
         );
         assert!(
             buffer
                 .content
                 .iter()
-                .any(|c| c.fg == NUMBER && c.bg == CHANGED_BG)
+                .any(|c| c.fg == dracula().number && c.bg == dracula().changed.row.bg.unwrap())
         );
         // Dimming visible context must not mutate the shared syntax cache.
-        assert_eq!(app.highlighted[0][0][6].spans[0].style.fg, Some(KEYWORD));
+        assert_eq!(
+            app.highlighted[0][0][6].spans[0].style.fg,
+            Some(dracula().keyword)
+        );
         assert_eq!(app.scroll, 6);
     }
 
     #[test]
     fn source_scrolls_beyond_match_and_navigation_refocuses_each_occurrence() {
-        let mut app = App::new(context_report());
+        let mut app = App::new(context_report(), ThemeName::Dracula);
         render(&mut app, 120, 24);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('j'));
@@ -1315,7 +1503,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .all(|c| !matches!(c.bg, ADDED_BG | REMOVED_BG | CHANGED_BG))
+                .all(|c| !dracula_diff_background(c.bg))
         );
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Open);
         assert_eq!(
@@ -1357,7 +1545,7 @@ mod tests {
 
     #[test]
     fn selected_match_stays_visible_on_resize_including_one_line_viewports() {
-        let mut app = App::new(context_report());
+        let mut app = App::new(context_report(), ThemeName::Dracula);
         for occurrence in 0..2 {
             let matched = 10 + occurrence * 20;
             for height in [48, 15, 14, 13, 24, 48] {
@@ -1390,7 +1578,7 @@ mod tests {
             KeyCode::Char('g'),
             KeyCode::Char('G'),
         ] {
-            let mut app = App::new(context_report());
+            let mut app = App::new(context_report(), ThemeName::Dracula);
             render(&mut app, 120, 24);
             app.focus = Focus::Code;
             press(&mut app, key);
@@ -1421,7 +1609,7 @@ mod tests {
         for snippet in &mut data.groups[0].occurrences {
             snippet.path = path.clone();
         }
-        let mut app = App::new(data);
+        let mut app = App::new(data, ThemeName::Dracula);
         assert!(Arc::ptr_eq(&app.highlighted[0][0], &app.highlighted[0][1]));
         let cache = Arc::clone(&app.highlighted[0][0]);
         std::fs::write(&path, "changed on disk").unwrap();
@@ -1430,6 +1618,10 @@ mod tests {
         app.cycle(true);
         assert!(render(&mut app, 160, 48).0.contains("fn line_30"));
         assert!(Arc::ptr_eq(&cache, &app.highlighted[0][0]));
+        press(&mut app, KeyCode::Char('t'));
+        assert!(!Arc::ptr_eq(&cache, &app.highlighted[0][0]));
+        assert!(Arc::ptr_eq(&app.highlighted[0][0], &app.highlighted[0][1]));
+        assert!(render(&mut app, 160, 48).0.contains("fn line_30"));
         assert!(
             app.report.groups[0].occurrences[0]
                 .source
@@ -1450,12 +1642,12 @@ mod tests {
             let snippet = &mut data.groups[0].occurrences[0];
             snippet.path = path.clone();
             snippet.warning = Some(warning.into());
-            let mut app = App::new(data);
+            let mut app = App::new(data, ThemeName::Dracula);
             let (text, buffer) = render(&mut app, 120, 24);
             assert!(text.contains(&format!("WARNING: {warning}")));
             assert!(text.contains(" 42 │ fn parse()"));
             assert!(!text.contains("unrelated disk content"));
-            assert!(buffer.content.iter().any(|c| c.fg == KEYWORD));
+            assert!(buffer.content.iter().any(|c| c.fg == dracula().keyword));
             assert_eq!(app.scroll, 0);
         }
     }
@@ -1467,7 +1659,7 @@ mod tests {
             &mut data.groups[0].occurrences[0],
             "日e\u{301}本tail\n// next",
         );
-        let mut app = App::new(data);
+        let mut app = App::new(data, ThemeName::Dracula);
         app.focus = Focus::Code;
         press(&mut app, KeyCode::Char('d'));
         for (offset, expected) in [(0, "日"), (2, "e\u{301}"), (3, "本"), (5, "t")] {
@@ -1492,8 +1684,8 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(row[gutter + 6].symbol(), expected, "offset {offset}");
-            assert_eq!(row[gutter + 1].fg, MUTED);
-            assert_eq!(row[gutter + 6].fg, FG);
+            assert_eq!(row[gutter + 1].fg, dracula().muted.fg.unwrap());
+            assert_eq!(row[gutter + 6].fg, dracula().foreground);
         }
         app.horizontal = 0;
         app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
@@ -1537,7 +1729,7 @@ mod tests {
         let mut data = report();
         set_source(&mut data.groups[0].occurrences[0], a);
         set_source(&mut data.groups[0].occurrences[1], b);
-        App::new(data)
+        App::new(data, ThemeName::Dracula)
     }
 
     fn source_rows(buffer: &ratatui::buffer::Buffer, needle: &str) -> Vec<(String, Color)> {
@@ -1551,8 +1743,8 @@ mod tests {
                 }
                 let color = row
                     .iter()
-                    .find(|c| matches!(c.bg, ADDED_BG | REMOVED_BG | CHANGED_BG))
-                    .map_or(PANEL, |c| c.bg);
+                    .find(|c| dracula_diff_background(c.bg))
+                    .map_or(dracula().panel.bg.unwrap(), |c| c.bg);
                 Some((text, color))
             })
             .collect()
@@ -1570,14 +1762,17 @@ mod tests {
         assert!(
             source_rows(&buffer, "fn keep()")
                 .iter()
-                .all(|(_, bg)| *bg == PANEL)
+                .all(|(_, bg)| *bg == dracula().panel.bg.unwrap())
         );
-        assert_eq!(source_rows(&buffer, "fn inserted()")[0].1, ADDED_BG);
+        assert_eq!(
+            source_rows(&buffer, "fn inserted()")[0].1,
+            dracula().added.row.bg.unwrap()
+        );
         assert!(
             buffer
                 .content
                 .iter()
-                .any(|c| c.bg == ADDED_BG && c.fg == KEYWORD)
+                .any(|c| c.bg == dracula().added.row.bg.unwrap() && c.fg == dracula().keyword)
         );
         press(&mut app, KeyCode::Char('d'));
         let (text, buffer) = render(&mut app, 120, 40);
@@ -1586,7 +1781,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .all(|c| !matches!(c.bg, ADDED_BG | REMOVED_BG | CHANGED_BG))
+                .all(|c| !dracula_diff_background(c.bg))
         );
         press(&mut app, KeyCode::Char('d'));
         assert!(
@@ -1594,7 +1789,7 @@ mod tests {
                 .1
                 .content
                 .iter()
-                .any(|c| c.bg == ADDED_BG)
+                .any(|c| c.bg == dracula().added.row.bg.unwrap())
         );
         assert_eq!(app.report.groups[0].occurrences[0].source, a);
         assert_eq!(app.report.groups[0].occurrences[1].source, b);
@@ -1610,7 +1805,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .any(|c| c.bg == CHANGED_BG && c.fg == STRING)
+                .any(|c| c.bg == dracula().changed.row.bg.unwrap() && c.fg == dracula().string)
         );
         app.focus = Focus::Code;
         app.horizontal = 4;
@@ -1620,7 +1815,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .any(|c| c.symbol() == "日" && c.bg == CHANGED_BG)
+                .any(|c| c.symbol() == "日" && c.bg == dracula().changed.row.bg.unwrap())
         );
         let mut equal = diff_app("let 日本語 = 42;\n", "let 日本語 = 42;\n");
         assert!(
@@ -1628,7 +1823,7 @@ mod tests {
                 .1
                 .content
                 .iter()
-                .all(|c| !matches!(c.bg, ADDED_BG | REMOVED_BG | CHANGED_BG))
+                .all(|c| !dracula_diff_background(c.bg))
         );
     }
 
@@ -1639,7 +1834,7 @@ mod tests {
         set_source(&mut third, "b\n");
         let mut data = app.report;
         data.groups[0].occurrences.push(third);
-        app = App::new(data);
+        app = App::new(data, ThemeName::Dracula);
         app.cycle(true);
         let (text, buffer) = render(&mut app, 120, 40);
         assert!(text.contains("compared #2 ↔ #3"));
@@ -1648,7 +1843,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .all(|c| !matches!(c.bg, ADDED_BG | REMOVED_BG | CHANGED_BG))
+                .all(|c| !dracula_diff_background(c.bg))
         );
         app.cycle(true);
         let (text, _) = render(&mut app, 120, 40);
@@ -1671,7 +1866,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .all(|c| !matches!(c.bg, ADDED_BG | REMOVED_BG | CHANGED_BG))
+                .all(|c| !dracula_diff_background(c.bg))
         );
     }
 
@@ -1692,15 +1887,18 @@ mod tests {
             "fn removed() {}\nfn stay() {}\n",
         );
         set_source(&mut data.groups[2].occurrences[1], "fn stay() {}\n");
-        let mut app = App::new(data);
+        let mut app = App::new(data, ThemeName::Dracula);
         press(&mut app, KeyCode::End);
         assert_eq!(app.pair_diff.as_ref().unwrap().group, 2);
         let (_, buffer) = render(&mut app, 120, 40);
-        assert_eq!(source_rows(&buffer, "fn removed()")[0].1, REMOVED_BG);
+        assert_eq!(
+            source_rows(&buffer, "fn removed()")[0].1,
+            dracula().removed.row.bg.unwrap()
+        );
         assert!(
             source_rows(&buffer, "fn stay()")
                 .iter()
-                .all(|(_, bg)| *bg == PANEL)
+                .all(|(_, bg)| *bg == dracula().panel.bg.unwrap())
         );
         press(&mut app, KeyCode::Home);
         assert_eq!(app.pair_diff.as_ref().unwrap().group, 0);
@@ -1726,7 +1924,12 @@ mod tests {
         assert_eq!(app.pair_diff.as_ref().unwrap().diff.left.as_ptr(), ptr);
         assert_eq!(buffer.area.height, 12);
         let (_, buffer) = render(&mut app, 120, 40);
-        assert!(buffer.content.iter().any(|c| c.bg == CHANGED_BG));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|c| c.bg == dracula().changed.row.bg.unwrap())
+        );
         press(&mut app, KeyCode::Char('?'));
         let text = render(&mut app, 100, 30).0;
         assert!(text.contains("Toggle exact-text diff"));
@@ -1764,7 +1967,7 @@ mod tests {
         data.mode = "syntax".into();
         data.groups[0].edges.clear();
         data.groups[0].occurrences[1].test_context = true;
-        let mut app = App::new(data);
+        let mut app = App::new(data, ThemeName::Dracula);
         assert_eq!(
             evidence(&app, 0, 0),
             "No pair similarity: #1 ↔ #2 · no direct edge"
@@ -1795,7 +1998,7 @@ mod tests {
 
     #[test]
     fn browser_snapshot_headings_pair_source_and_colors() {
-        let mut app = App::new(report());
+        let mut app = App::new(report(), ThemeName::Dracula);
         let (text, buffer) = render(&mut app, 120, 40);
         for expected in [
             "rsdup",
@@ -1811,7 +2014,12 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?}\n{text}");
         }
-        for color in [KEYWORD, STRING, NUMBER, FUNCTION] {
+        for color in [
+            dracula().keyword,
+            dracula().string,
+            dracula().number,
+            dracula().function,
+        ] {
             assert!(
                 buffer.content.iter().any(|cell| cell.fg == color),
                 "missing {color:?}"
@@ -1821,7 +2029,7 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .any(|cell| cell.bg == Color::Rgb(42, 66, 78))
+                .any(|cell| cell.bg == dracula().selection.bg.unwrap())
         );
         assert!(!text.contains("equivalence"));
     }
@@ -1829,10 +2037,13 @@ mod tests {
     #[test]
     fn multiline_tokens_keep_styles_and_original_text() {
         let source = "/* a\nb */\nlet s = r#\"a\nb\"#;\n";
-        let lines = highlight(source);
+        let lines = highlight(source, &Theme::new(ThemeName::Dracula));
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[1].spans[0].style.fg, Some(MUTED));
-        assert_eq!(lines[3].spans[0].style.fg, Some(STRING));
+        assert_eq!(
+            lines[1].spans[0].style.fg,
+            Some(dracula().muted.fg.unwrap())
+        );
+        assert_eq!(lines[3].spans[0].style.fg, Some(dracula().string));
         let recovered = lines
             .iter()
             .map(|line| {
@@ -1848,7 +2059,7 @@ mod tests {
 
     #[test]
     fn incremental_unicode_search_cancel_and_selection() {
-        let mut app = App::new(report());
+        let mut app = App::new(report(), ThemeName::Dracula);
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.group_index(), Some(1));
         press(&mut app, KeyCode::Char('/'));
@@ -1884,7 +2095,7 @@ mod tests {
             &mut data.groups[0].occurrences[0],
             &"let x = 1;\n".repeat(100),
         );
-        let mut app = App::new(data);
+        let mut app = App::new(data, ThemeName::Dracula);
         render(&mut app, 100, 24);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.focus, Focus::Code);
@@ -1911,7 +2122,7 @@ mod tests {
 
     #[test]
     fn empty_filtered_narrow_and_help_screens() {
-        let mut app = App::new(report());
+        let mut app = App::new(report(), ThemeName::Dracula);
         for (w, h) in [(1, 1), (20, 6), (59, 20), (60, 12), (80, 24), (120, 40)] {
             render(&mut app, w, h);
         }
@@ -1924,11 +2135,14 @@ mod tests {
         app.filter();
         assert!(render(&mut app, 100, 24).0.contains("No matches for"));
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Draw);
-        let mut empty = App::new(BrowserReport {
-            mode: "syntax".into(),
-            groups: vec![],
-            files: 0,
-        });
+        let mut empty = App::new(
+            BrowserReport {
+                mode: "syntax".into(),
+                groups: vec![],
+                files: 0,
+            },
+            ThemeName::Dracula,
+        );
         for code in [
             KeyCode::Char('j'),
             KeyCode::Char('G'),
@@ -1997,16 +2211,21 @@ mod tests {
             .is_err()
         );
 
-        let mut app = App::new(report());
+        let mut app = App::new(report(), ThemeName::Dracula);
         app.status = Some((true, "Editor: editor failed".into()));
         let (text, buffer) = render(&mut app, 100, 24);
         assert!(text.contains("Editor: editor failed"));
-        assert!(buffer.content.iter().any(|cell| cell.fg == ERROR));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.fg == dracula().error.fg.unwrap())
+        );
     }
 
     #[test]
     fn backend_resize_and_focused_occurrence_paging() {
-        let mut app = App::new(report());
+        let mut app = App::new(report(), ThemeName::Dracula);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         for (width, height) in [(120, 40), (60, 12), (20, 6), (1, 1), (100, 30)] {
             terminal.backend_mut().resize(width, height);
@@ -2034,7 +2253,7 @@ mod tests {
             cosine: 0.7,
             exact_body: false,
         });
-        let mut app = App::new(data);
+        let mut app = App::new(data, ThemeName::Dracula);
         assert!(!evidence(&app, 0, 0).contains("#3"));
         assert!(evidence(&app, 0, 1).contains("#1 ↔ #2: same-token"));
         app.cycle(true);
