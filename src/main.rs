@@ -82,7 +82,7 @@ struct Cli {
     #[arg(long, value_name = "COMMAND")]
     editor: Option<String>,
 
-    /// TUI color theme (default: dracula). See --list-themes; t/T cycles in the browser.
+    /// TUI color theme (default: dracula). See --list-themes; t opens the theme picker.
     #[arg(long, value_name = "NAME")]
     theme: Option<theme::ThemeName>,
 
