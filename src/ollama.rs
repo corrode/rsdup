@@ -7,7 +7,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -93,6 +93,28 @@ impl OllamaEmbedder {
         let tag =
             discover_embedding_model(fetch_tags(&agent)?, |name| fetch_capabilities(&agent, name))?;
         Self::from_tag(agent, tag, cache_dir)
+    }
+
+    /// Discover the sole installed embedding model within a shared HTTP time budget.
+    ///
+    /// Unlike [`Self::auto`], bounds the combined tags and capability requests.
+    /// Inference retains its normal timeout. No background worker or download is started.
+    pub fn auto_with_discovery_timeout(
+        cache_dir: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let discovery_agent = || -> Result<ureq::Agent> {
+            Ok(local_agent_with_timeout(discovery_time_remaining(
+                timeout,
+                started.elapsed(),
+            )?))
+        };
+        let tags = fetch_tags(&discovery_agent()?)?;
+        let tag =
+            discover_embedding_model(tags, |name| fetch_capabilities(&discovery_agent()?, name))?;
+        discovery_time_remaining(timeout, started.elapsed())?;
+        Self::from_tag(local_agent(), tag, cache_dir)
     }
 
     fn from_tag(agent: ureq::Agent, tag: Tag, cache_dir: Option<PathBuf>) -> Result<Self> {
@@ -234,12 +256,23 @@ impl Embedder for OllamaEmbedder {
     }
 }
 
+fn discovery_time_remaining(timeout: Duration, elapsed: Duration) -> Result<Duration> {
+    timeout
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .context("Ollama discovery timed out; check the local server or specify --embedding-model <name>")
+}
+
 fn local_agent() -> ureq::Agent {
+    local_agent_with_timeout(Duration::from_secs(120))
+}
+
+fn local_agent_with_timeout(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
         .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(120)))
+        .timeout_global(Some(timeout))
         .build()
         .into()
 }
@@ -249,7 +282,7 @@ fn fetch_tags(agent: &ureq::Agent) -> Result<Tags> {
         let response = agent.get(&format!("{ENDPOINT}/api/tags")).call()?;
         read_response(response)
     })()
-    .context("cannot query local Ollama at http://localhost:11434/api/tags; install Ollama and start it (for example, `ollama serve`), then retry; rsdup never downloads models")
+    .context("cannot query local Ollama at http://localhost:11434/api/tags; install Ollama and start it (for example, `ollama serve`), then retry; rsdup never downloads Ollama models")
 }
 
 fn fetch_capabilities(agent: &ureq::Agent, model: &str) -> Result<Vec<String>> {
@@ -283,7 +316,7 @@ fn discover_embedding_model(
     }
     match candidates.as_slice() {
         [] => bail!(
-            "no installed Ollama model supports embeddings; install an embedding model separately, then retry (rsdup never downloads models)"
+            "no installed Ollama model supports embeddings; install an embedding model separately, then retry (rsdup never downloads Ollama models)"
         ),
         [name] => resolve_model(tags, name),
         _ => bail!(
@@ -345,7 +378,7 @@ fn resolve_model(tags: Tags, requested: &str) -> Result<Tag> {
     let mut matching = tags.models.into_iter().filter(|tag| tag.name == name);
     let Some(mut tag) = matching.next() else {
         bail!(
-            "Ollama model {requested:?} is not installed locally; install it separately, then retry (rsdup never downloads models)"
+            "Ollama model {requested:?} is not installed locally; install it separately, then retry (rsdup never downloads Ollama models)"
         );
     };
     ensure!(
@@ -419,6 +452,26 @@ fn cache_key(body: &str, metadata: &OllamaMetadata, policy: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_timeout_uses_remaining_budget() {
+        let timeout = Duration::from_secs(3);
+        assert_eq!(
+            discovery_time_remaining(timeout, Duration::from_secs(1)).unwrap(),
+            Duration::from_secs(2)
+        );
+        for elapsed in [timeout, Duration::from_secs(4)] {
+            assert!(discovery_time_remaining(timeout, elapsed).is_err());
+        }
+    }
+
+    #[test]
+    fn zero_discovery_budget_fails_without_network_access() {
+        let error = OllamaEmbedder::auto_with_discovery_timeout(None, Duration::ZERO)
+            .err()
+            .expect("zero budget must fail before querying Ollama");
+        assert!(error.to_string().contains("discovery timed out"));
+    }
 
     fn embedder(cache_dir: Option<PathBuf>) -> OllamaEmbedder {
         OllamaEmbedder {
@@ -592,7 +645,10 @@ mod tests {
         for models in [vec![], vec![model("chat:latest", &["completion"])]] {
             let error = discover(models).unwrap_err().to_string();
             assert!(error.contains("install an embedding model"), "{error}");
-            assert!(error.contains("rsdup never downloads models"), "{error}");
+            assert!(
+                error.contains("rsdup never downloads Ollama models"),
+                "{error}"
+            );
         }
     }
 

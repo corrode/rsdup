@@ -14,14 +14,12 @@ use ra_ap_syntax::{
 use rsdup::{Position, Report, semantic::SemanticReport};
 
 pub(crate) struct BrowserReport {
-    pub mode: String,
     pub groups: Vec<MatchGroup>,
     pub files: usize,
 }
 
 pub(crate) struct MatchGroup {
     pub title: String,
-    pub description: String,
     pub occurrences: Vec<Snippet>,
     pub edges: Vec<PairEvidence>,
 }
@@ -218,54 +216,61 @@ pub(crate) fn semantic(report: &SemanticReport) -> BrowserReport {
                     exact_body: edge.exact_body,
                 })
                 .collect();
-            let pairs = occurrences.len() * occurrences.len().saturating_sub(1) / 2;
-            let description = format!(
-                "{} locations · {}/{} pairs matched · similarity is not equivalence",
-                occurrences.len(),
-                edges.len(),
-                pairs
-            );
+
             MatchGroup {
                 title: group_title(&occurrences),
-                description,
                 occurrences,
                 edges,
             }
         })
         .collect();
     BrowserReport {
-        mode: "semantic".into(),
         groups,
         files: report.summary.files,
     }
 }
 
-pub(crate) fn syntax(report: &Report, mode: &str) -> BrowserReport {
+pub(crate) fn syntax(report: &Report) -> BrowserReport {
     let mut sources = Sources::new();
-    let groups = report.clones.iter().map(|clone| {
-        let occurrences: Vec<_> = clone.occurrences.iter().map(|occurrence| {
-            let mut snippet = Snippet::new("statement sequence".into(), &occurrence.path, &occurrence.start, &occurrence.source, false);
-            let current = load(&mut sources, &occurrence.path);
-            snippet.with_context(current, &occurrence.end);
-            if snippet.warning.is_none()
-                && let Ok(source) = current
-                && let Some(start) = offset(&source.text, &occurrence.start)
-                && let Some((_, _, name)) = source.functions.iter()
-                    .filter(|(from, to, _)| *from <= start && start < *to)
-                    .min_by_key(|(from, to, _)| to - from)
-            {
-                snippet.name = format!("{name}()");
+    let groups = report
+        .clones
+        .iter()
+        .map(|clone| {
+            let occurrences: Vec<_> = clone
+                .occurrences
+                .iter()
+                .map(|occurrence| {
+                    let mut snippet = Snippet::new(
+                        "statement sequence".into(),
+                        &occurrence.path,
+                        &occurrence.start,
+                        &occurrence.source,
+                        false,
+                    );
+                    let current = load(&mut sources, &occurrence.path);
+                    snippet.with_context(current, &occurrence.end);
+                    if snippet.warning.is_none()
+                        && let Ok(source) = current
+                        && let Some(start) = offset(&source.text, &occurrence.start)
+                        && let Some((_, _, name)) = source
+                            .functions
+                            .iter()
+                            .filter(|(from, to, _)| *from <= start && start < *to)
+                            .min_by_key(|(from, to, _)| to - from)
+                    {
+                        snippet.name = format!("{name}()");
+                    }
+                    snippet
+                })
+                .collect();
+            MatchGroup {
+                title: group_title(&occurrences),
+                occurrences,
+                edges: Vec::new(),
             }
-            snippet
-        }).collect();
-        MatchGroup {
-            title: group_title(&occurrences),
-            description: format!("{} locations · {} anchored tokens · {} syntax holes · normalized syntax, not behavioral equivalence", occurrences.len(), clone.tokens, clone.holes),
-            occurrences, edges: Vec::new(),
-        }
-    }).collect();
+        })
+        .collect();
     BrowserReport {
-        mode: mode.into(),
         groups,
         files: report.summary.files,
     }
@@ -422,7 +427,7 @@ mod tests {
             },
         )
         .unwrap();
-        let browser = syntax(&report, "near-miss");
+        let browser = syntax(&report);
         assert!(!browser.groups.is_empty());
         assert!(
             browser.groups[0]
@@ -437,7 +442,7 @@ mod tests {
                 .all(|snippet| snippet.warning.is_none())
         );
         fs::write(&path, source.replace("consume", "replace")).unwrap();
-        let changed = syntax(&report, "near-miss");
+        let changed = syntax(&report);
         for snippet in &changed.groups[0].occurrences {
             assert!(snippet.warning.is_some());
             assert!(snippet.source.contains("consume"));
@@ -446,10 +451,6 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert!(json["clones"][0]["occurrences"][0].get("source").is_none());
         fs::remove_file(path).unwrap();
-        assert!(
-            syntax(&report, "near-miss").groups[0].occurrences[0]
-                .warning
-                .is_some()
-        );
+        assert!(syntax(&report).groups[0].occurrences[0].warning.is_some());
     }
 }

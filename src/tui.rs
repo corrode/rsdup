@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     io::{self, IsTerminal},
     panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -38,7 +38,7 @@ type Highlighted = Vec<Line<'static>>;
 pub(crate) fn run(report: BrowserReport, editor: Option<&str>, theme: ThemeName) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
-            "the match browser requires an interactive terminal on stdin and stdout; run without piping or redirection, or use a non-interactive output mode"
+            "rsdup requires an interactive terminal on stdin and stdout; run without piping or redirection, or use a non-interactive output mode"
         );
     }
     let mut app = App::new(report, theme);
@@ -115,6 +115,7 @@ fn run_terminal(app: &mut App, editor: Option<&str>) -> Result<()> {
     session.enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
+    let mut clipboard = crate::clipboard::Clipboard::default();
     loop {
         terminal.draw(|frame| draw(frame, app))?;
         // Block until a meaningful event; no polling timer or repeated idle draws.
@@ -128,6 +129,7 @@ fn run_terminal(app: &mut App, editor: Option<&str>) -> Result<()> {
         match action {
             Action::Quit => break,
             Action::Draw => {}
+            Action::Copy => app.copy_with(|text| clipboard.copy(text)),
             Action::Open => {
                 if let Some(snippet) = app.snippet() {
                     let result = with_suspended(&mut session, || {
@@ -189,6 +191,7 @@ enum Focus {
 enum Action {
     Draw,
     Open,
+    Copy,
     Quit,
 }
 
@@ -542,6 +545,18 @@ impl App {
         }
     }
 
+    fn copy_with(&mut self, copy: impl FnOnce(&str) -> Result<()>) {
+        let Some(snippet) = self.snippet() else {
+            return;
+        };
+        let path = relative_path(&snippet.path, self.cwd.as_deref());
+        let location = format!("{}:{}", path.display(), snippet.start_line);
+        self.status = Some(match copy(&location) {
+            Ok(()) => (false, format!("Copied {location}")),
+            Err(error) => (true, format!("Clipboard: {error:#}")),
+        });
+    }
+
     fn key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
@@ -634,6 +649,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
+            KeyCode::Char('y') if self.snippet().is_some() => return Action::Copy,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('s') => {
                 self.sort_picker = GroupSort::ALL.iter().position(|&s| s == self.sort)
@@ -739,6 +755,50 @@ impl App {
         self.refresh_diff();
         Action::Draw
     }
+}
+
+/// Lexical only: source files may have moved or disappeared since the scan.
+fn relative_path(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    fn normalize(path: &Path) -> PathBuf {
+        let mut result = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if matches!(result.components().next_back(), Some(Component::Normal(_))) {
+                        result.pop();
+                    } else if !result.has_root() {
+                        result.push(component);
+                    }
+                }
+                _ => result.push(component),
+            }
+        }
+        result
+    }
+    let Some(cwd) = cwd else {
+        return normalize(path);
+    };
+    let cwd = normalize(cwd);
+    let path = normalize(&cwd.join(path));
+    let base: Vec<_> = cwd.components().collect();
+    let target: Vec<_> = path.components().collect();
+    // Different Windows drives / UNC roots cannot be expressed relatively.
+    if base.first() != target.first() || cwd.has_root() != path.has_root() {
+        return path;
+    }
+    let common = base.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut result = PathBuf::new();
+    for _ in &base[common..] {
+        result.push("..");
+    }
+    for component in &target[common..] {
+        result.push(component);
+    }
+    if result.as_os_str().is_empty() {
+        result.push(".");
+    }
+    result
 }
 
 fn initial_scroll(snippet: &Snippet, page: usize) -> usize {
@@ -870,7 +930,10 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
     if area.width < 60 || area.height < 12 {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled("rsdup · match browser", app.theme.accent),
+                Line::styled(
+                    format!("rsdup · {}", app.theme_name.display_name()),
+                    app.theme.accent,
+                ),
                 Line::from("Enlarge terminal to at least 60 × 12."),
                 Line::from(format!(
                     "{} matches · {} file{}",
@@ -900,15 +963,11 @@ fn draw_browser(frame: &mut Frame, app: &mut App) {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(" rsdup ", app.theme.accent.add_modifier(Modifier::BOLD)),
-                Span::raw(format!(
-                    "/ {} / match browser · {}",
-                    app.report.mode,
-                    app.theme_name.display_name()
-                )),
+                Span::raw(format!("· {}", app.theme_name.display_name())),
             ]),
             Line::styled(
                 format!(
-                    " {} matches · {} file{} · read-only",
+                    " {} matches · {} file{}",
                     app.report.groups.len(),
                     app.report.files,
                     if app.report.files == 1 { "" } else { "s" }
@@ -1252,21 +1311,18 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                format!(
-                    " Match #{} · occurrence {}/{}",
-                    group_index + 1,
-                    app.occurrence + 1,
-                    count
-                ),
-                app.theme.accent,
+        Paragraph::new(vec![Line::styled(
+            format!(
+                " Match #{} · occurrence {}/{}",
+                group_index + 1,
+                app.occurrence + 1,
+                count
             ),
-            Line::styled(format!(" {}", group.description), app.theme.muted),
-        ]),
+            app.theme.accent,
+        )]),
         rows[0],
     );
     let pair = count > 1 && rows[1].height >= 18;
@@ -1307,16 +1363,12 @@ fn evidence(app: &App, group_index: usize, _occurrence: usize) -> String {
         .find(|e| (e.left == left && e.right == right) || (e.left == right && e.right == left))
     {
         format!(
-            "{pair}: {}cosine {:.3}",
-            if edge.exact_body {
-                "same-token · "
-            } else {
-                ""
-            },
+            "{pair}: {}similarity {:.3}",
+            if edge.exact_body { "same code · " } else { "" },
             edge.cosine
         )
     } else {
-        format!("No pair similarity: {pair} · no direct edge")
+        format!("{pair}: Not directly compared")
     }
 }
 
@@ -1413,7 +1465,7 @@ fn draw_card(
         format!("WARNING: {warning}")
     } else {
         format!(
-            "context dimmed · matched lines {}–{} · {context}",
+            "Lines {}–{} · {context}",
             snippet.match_start_line, snippet.match_end_line
         )
     };
@@ -1539,13 +1591,17 @@ fn draw_card(
 
 fn diff_legend(app: &App) -> String {
     let Some(pair) = &app.pair_diff else {
-        return " No comparison pair · d diff · context dimmed".into();
+        return " No comparison pair · d diff".into();
     };
     let a = pair.left + 1;
     let b = pair.right + 1;
     format!(
-        " {}compared #{a} ↔ #{b}; − only #{a} / + only #{b}{} · context dimmed",
-        if pair.diff.limited { "LIMIT: " } else { "" },
+        " {}compared #{a} ↔ #{b}; − only #{a} / + only #{b}{}",
+        if pair.diff.limited {
+            "Diff too large; approximate: "
+        } else {
+            ""
+        },
         if app.diff_enabled {
             " · d on"
         } else {
@@ -1595,7 +1651,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(diff_legend(app)),
             Line::styled(
                 format!(
-                    " s sort · t theme: {} · n/p pair · ? help · q quit",
+                    " y copy path:line · s sort · t theme: {} · n/p pair · ? help · q quit",
                     app.theme_name.display_name()
                 ),
                 app.theme.muted,
@@ -1718,18 +1774,14 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
             Line::from("s                   Sort groups (Enter apply / Esc cancel)"),
             Line::from("PgUp / PgDn         Page in the focused pane"),
             Line::from("g/G / Home/End      First / last match or source page"),
-            Line::from("Context dimmed by line; matched lines keep syntax and diff."),
+            Line::from("y                   Copy focused path:start line"),
             Line::from("/                   Search titles, names and paths"),
             Line::from("Enter in search     Keep filter; return to navigation"),
             Line::from("Esc                 Clear filter / cancel search"),
             Line::from("Enter / o           Open focused occurrence in editor"),
             Line::from("Picker: ↑/↓ or Ctrl-N/P move; Enter apply; Esc cancel"),
             Line::from("q / Ctrl-C          Quit (Ctrl-C works in every mode)"),
-            Line::from("±: changed; LIMIT: conservative marks (work cap)"),
-            Line::styled(
-                "Pair evidence is not a semantic equivalence claim.",
-                theme.muted,
-            ),
+            Line::from("Large diffs use approximate change highlights."),
             Line::from("Esc / ? / Enter     Close help"),
         ])
         .block(panel(theme, " Browser controls ", true)),
@@ -2219,12 +2271,10 @@ mod tests {
 
     fn report() -> BrowserReport {
         BrowserReport {
-            mode: "semantic".into(),
             files: 3,
             groups: vec![
                 MatchGroup {
                     title: "Duplicate parsers".into(),
-                    description: "Original Rust source".into(),
                     occurrences: vec![
                         snippet("parse", "src/one.rs"),
                         snippet("parse_again", "src/two.rs"),
@@ -2238,7 +2288,6 @@ mod tests {
                 },
                 MatchGroup {
                     title: "Unicode λ".into(),
-                    description: String::new(),
                     occurrences: vec![snippet("日本語", "src/日本語.rs")],
                     edges: vec![],
                 },
@@ -2328,7 +2377,7 @@ mod tests {
             " 30 + fn line_30",
             " 31 + fn line_31",
             " 32 │ fn line_32",
-            "context dimmed · matched lines 10–11",
+            "Lines 10–11",
         ] {
             assert!(text.contains(expected), "missing {expected:?}\n{text}");
         }
@@ -2393,10 +2442,9 @@ mod tests {
         let (text, buffer) = render(&mut app, 120, 24);
         assert!(text.contains(" 80 │ fn line_80"));
         assert!(
-            buffer
-                .content
+            source_rows(&buffer, "fn line_80")
                 .iter()
-                .all(|c| !dracula_diff_background(c.bg))
+                .all(|(_, bg)| !dracula_diff_background(*bg))
         );
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Open);
         assert_eq!(
@@ -2483,7 +2531,7 @@ mod tests {
             assert_eq!(app.scroll, scroll.min(app.max_scroll()), "{key:?}");
             press(&mut app, KeyCode::Char('n'));
             let (text, _) = render(&mut app, 120, 13);
-            assert_eq!(app.scroll, 29);
+            assert_eq!(app.scroll, 29 - 3.min(app.page - 1));
             assert!(app.match_scroll_anchored);
             assert!(text.contains(" 30 − fn line_30"));
         }
@@ -2733,7 +2781,7 @@ mod tests {
         app.cycle(true);
         let (text, buffer) = render(&mut app, 120, 40);
         assert!(text.contains("compared #2 ↔ #3"));
-        assert!(text.contains("No pair similarity: #2 ↔ #3 · no direct edge"));
+        assert!(text.contains("#2 ↔ #3: Not directly compared"));
         assert!(
             buffer
                 .content
@@ -2770,7 +2818,6 @@ mod tests {
         let mut data = report();
         data.groups.push(MatchGroup {
             title: "Third group".into(),
-            description: String::new(),
             occurrences: vec![
                 snippet("left", "src/left.rs"),
                 snippet("right", "src/right.rs"),
@@ -2815,7 +2862,7 @@ mod tests {
         let mut app = diff_app(&"a\n".repeat(1100), &"b\n".repeat(1100));
         let ptr = app.pair_diff.as_ref().unwrap().diff.left.as_ptr();
         let (text, buffer) = render(&mut app, 60, 12);
-        assert!(text.contains("LIMIT: compared #1 ↔ #2"));
+        assert!(text.contains("Diff too large; approximate:"));
         assert_eq!(app.pair_diff.as_ref().unwrap().diff.left.as_ptr(), ptr);
         assert_eq!(buffer.area.height, 12);
         let (_, buffer) = render(&mut app, 120, 40);
@@ -2828,7 +2875,7 @@ mod tests {
         press(&mut app, KeyCode::Char('?'));
         let text = render(&mut app, 100, 30).0;
         assert!(text.contains("Toggle exact-text diff"));
-        assert!(text.contains("LIMIT: conservative marks"));
+        assert!(text.contains("Large diffs use approximate change highlights."));
     }
 
     #[test]
@@ -2859,17 +2906,14 @@ mod tests {
     #[test]
     fn syntax_evidence_context_and_warning_labels() {
         let mut data = report();
-        data.mode = "syntax".into();
+
         data.groups[0].edges.clear();
         data.groups[0].occurrences[1].test_context = true;
         let mut app = App::new(data, ThemeName::Dracula);
-        assert_eq!(
-            evidence(&app, 0, 0),
-            "No pair similarity: #1 ↔ #2 · no direct edge"
-        );
+        assert_eq!(evidence(&app, 0, 0), "#1 ↔ #2: Not directly compared");
         let (text, _) = render(&mut app, 160, 40);
-        assert!(text.contains("No pair similarity: #1 ↔ #2 · no direct edge"));
-        assert!(text.contains("context dimmed · matched lines"));
+        assert!(text.contains("#1 ↔ #2: Not directly compared"));
+        assert!(text.contains("Lines 42–"));
         assert!(text.contains("test context"));
         assert!(!text.contains("production"));
         assert!(!text.contains("No pair evidence"));
@@ -2877,11 +2921,8 @@ mod tests {
         let (text, _) = render(&mut app, 100, 24);
         assert!(text.contains("WARNING: stale source: file changed"));
         assert!(!text.contains("source · WARNING"));
-        app.report.mode = "semantic".into();
-        assert_eq!(
-            evidence(&app, 0, 0),
-            "No pair similarity: #1 ↔ #2 · no direct edge"
-        );
+        assert!(!text.contains("similarity 0.000"));
+        assert!(!text.contains("similarity 0.988"));
     }
 
     fn sorting_report() -> BrowserReport {
@@ -2890,7 +2931,6 @@ mod tests {
             .into_iter()
             .map(|(name, count, length)| MatchGroup {
                 title: name.into(),
-                description: String::new(),
                 occurrences: (0..count)
                     .map(|i| {
                         let mut s = snippet(
@@ -3177,6 +3217,105 @@ mod tests {
     }
 
     #[test]
+    fn copy_uses_focused_start_line_not_scroll_and_reports_outcome() {
+        let mut app = App::new(context_report(), ThemeName::Dracula);
+        app.cwd = Some(PathBuf::from("/work/project"));
+        app.report.groups[0].occurrences[1].path = PathBuf::from("/work/日本語/a b;$(no).rs");
+        app.cycle(true);
+        app.focus = Focus::Code;
+        press(&mut app, KeyCode::End);
+        assert_eq!(press(&mut app, KeyCode::Char('y')), Action::Copy);
+        assert!(app.status.is_none());
+        app.copy_with(|payload| {
+            assert_eq!(payload, "../日本語/a b;$(no).rs:30");
+            Ok(())
+        });
+        assert_eq!(
+            app.status,
+            Some((false, "Copied ../日本語/a b;$(no).rs:30".into()))
+        );
+        app.copy_with(|_| bail!("system clipboard unavailable"));
+        assert_eq!(
+            app.status,
+            Some((true, "Clipboard: system clipboard unavailable".into()))
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('n')), Action::Draw);
+        assert_eq!(app.occurrence, 0);
+        app.copy_with(|payload| {
+            assert_eq!(payload, "src/one.rs:10");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn copy_is_isolated_in_modes_and_empty_reports() {
+        for mode in ['t', 's', '/', '?'] {
+            let mut app = App::new(report(), ThemeName::Dracula);
+            press(&mut app, KeyCode::Char(mode));
+            assert_eq!(press(&mut app, KeyCode::Char('y')), Action::Draw);
+            assert!(app.status.is_none());
+            if mode == '/' {
+                assert_eq!(app.query, "y");
+            }
+        }
+        let mut data = report();
+        data.groups.clear();
+        let mut app = App::new(data, ThemeName::Dracula);
+        assert_eq!(press(&mut app, KeyCode::Char('y')), Action::Draw);
+        app.copy_with(|_| panic!("empty report must not copy"));
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn clipboard_paths_are_lexical_and_relative_including_external_files() {
+        let cwd = Some(Path::new("/work/project"));
+        for (path, expected) in [
+            ("/work/project/src/file.rs", "src/file.rs"),
+            ("/work/project-other/file.rs", "../project-other/file.rs"),
+            ("/elsewhere/file.rs", "../../elsewhere/file.rs"),
+            ("./src/../file.rs", "file.rs"),
+            ("../日本語/a b.rs", "../日本語/a b.rs"),
+            ("/work/project/src/../../other/file.rs", "../other/file.rs"),
+        ] {
+            assert_eq!(relative_path(Path::new(path), cwd), Path::new(expected));
+        }
+        assert_eq!(
+            relative_path(Path::new("src/file.rs"), None),
+            Path::new("src/file.rs")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn different_drives_keep_absolute_paths() {
+        assert_eq!(
+            relative_path(Path::new(r"D:\src\file.rs"), Some(Path::new(r"C:\work"))),
+            Path::new(r"D:\src\file.rs")
+        );
+    }
+
+    #[test]
+    fn visible_ui_omits_internal_jargon_and_disclaimers() {
+        let mut app = App::new(report(), ThemeName::Dracula);
+        for help in [false, true] {
+            app.help = help;
+            let text = render(&mut app, 160, 40).0.to_lowercase();
+            for unwanted in [
+                "match browser",
+                "read-only",
+                "context dimmed",
+                "equivalence",
+                "cosine",
+                "edges",
+                "anchors",
+            ] {
+                assert!(!text.contains(unwanted), "found {unwanted}: {text}");
+            }
+            assert!(text.contains("rsdup · dracula"));
+        }
+    }
+
+    #[test]
     fn browser_snapshot_headings_pair_source_and_colors() {
         let mut app = App::new(report(), ThemeName::Dracula);
         let (text, buffer) = render(&mut app, 120, 40);
@@ -3188,8 +3327,8 @@ mod tests {
             "#2 parse_again",
             "src/one.rs:42:5",
             "42 │ fn parse()",
-            "same-token",
-            "cosine 0.988",
+            "same code",
+            "similarity 0.988",
             "s sort",
         ] {
             assert!(text.contains(expected), "missing {expected:?}\n{text}");
@@ -3317,7 +3456,6 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Draw);
         let mut empty = App::new(
             BrowserReport {
-                mode: "syntax".into(),
                 groups: vec![],
                 files: 0,
             },
@@ -3413,7 +3551,7 @@ mod tests {
             assert_eq!(terminal.backend().buffer().area.width, width);
         }
         press(&mut app, KeyCode::Char('n'));
-        let (small, _) = render(&mut app, 100, 24);
+        let (small, _) = render(&mut app, 100, 23);
         assert!(small.contains("#2 parse_again"));
         assert!(!small.contains("#1 parse"));
         let (tall, _) = render(&mut app, 100, 40);
@@ -3435,10 +3573,10 @@ mod tests {
         });
         let mut app = App::new(data, ThemeName::Dracula);
         assert!(!evidence(&app, 0, 0).contains("#3"));
-        assert!(evidence(&app, 0, 1).contains("#1 ↔ #2: same-token"));
+        assert!(evidence(&app, 0, 1).contains("#1 ↔ #2: same code"));
         app.cycle(true);
-        assert!(evidence(&app, 0, 1).contains("#2 ↔ #3: cosine 0.700"));
-        assert!(!evidence(&app, 0, 2).contains("same-token"));
+        assert!(evidence(&app, 0, 1).contains("#2 ↔ #3: similarity 0.700"));
+        assert!(!evidence(&app, 0, 2).contains("same code"));
         app.report.groups[0].occurrences.clear();
         assert!(render(&mut app, 100, 24).0.contains("no occurrences"));
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Draw);

@@ -9,7 +9,9 @@ rsdup src
 
 Use `--locked` when installing to use the tested dependency versions in `Cargo.lock`.
 
-`rsdup src` requires a running local Ollama service and an installed embedding model. If exactly one installed model supports embeddings, rsdup selects it automatically; with several, choose one with `--embedding-model`. Install the model separately: rsdup never downloads models or calls a cloud embedding API.
+`rsdup src` first looks for a usable local Ollama embedding model. If exactly one is installed, it uses that model automatically. Otherwise, it asks you to choose **FastEmbed** (in-process CPU inference, with a ~642 MB model download on first use) or **Ollama** (setup instructions for your local service). Your source stays on your machine. Choices apply to the current run; use `--embedding-backend fastembed` or `--embedding-backend ollama` to choose explicitly. With several Ollama models, select one using `--embedding-model`.
+
+Prompts require terminal stdin and stderr and are disabled by `--quiet`. In scripts, select a backend explicitly; auto mode fails with setup instructions if Ollama cannot be selected. Explicit FastEmbed selection authorizes downloading its pinned public model if missing. Model download progress and backend messages go to stderr, leaving JSON output clean.
 
 For an immediate offline scan without a model:
 
@@ -21,7 +23,7 @@ rsdup src --mode near-miss
 
 | Mode | Advantages and when to prefer it | Limitations |
 | --- | --- | --- |
-| `semantic` (default) | Broad similarity search across function, closure, and async-block bodies, even with changed calls, types, or setup steps. Prefer it for exploratory review. | Fuzzy, model-dependent candidates, not equivalent behavior. Requires a local embedding service, adds service latency, and compares pairs in quadratic time. |
+| `semantic` (default) | Broad similarity search across function, closure, and async-block bodies, even with changed calls, types, or setup steps. Prefer it for exploratory review. | Fuzzy, model-dependent candidates, not equivalent behavior. Requires local model weights, consumes CPU/GPU resources, and compares pairs in quadratic time. FastEmbed CPU can be slower than GPU-backed Ollama. |
 | `near-miss` | Deterministic, offline matching of complete statements with small, conservative expression holes. Prefer it for repeatable copy-paste checks that allow limited variation. | Misses inserted or reordered statements and changed fixed anchors. |
 | `exact` | Deterministic, offline, strictest structural matching under the selected normalization profile. Prefer it when holes would be too permissive. | Misses structural edits. The default `balanced` normalization still ignores some name and literal differences; this is neither byte equality nor behavioral equivalence. |
 
@@ -92,11 +94,11 @@ The diff compares exact text, including whitespace and line endings—not normal
 | `d` | Toggle difference highlighting (on by default) |
 | `t` | Open the theme picker; type to filter |
 | `s` | Choose match sorting: occurrences, matched lines, distinct files, or path |
-
 | `PgUp` / `PgDn`, `g` / `G` | Page or jump to the beginning/end of the focused pane |
 | `H` / `L`, `Shift-Left` / `Shift-Right` | Scroll source horizontally; line numbers stay fixed |
 | `/` | Filter groups by function name or path; Enter keeps the filter, Esc clears it |
 | `Enter` / `o` | Open the focused occurrence in your editor |
+| `y` | Copy the focused occurrence’s relative `path:line` |
 | `?` | Show keyboard help |
 | `q` / `Ctrl-C` | Quit |
 
@@ -104,11 +106,13 @@ Press `s` to choose another ordering with arrows or `Ctrl-N`/`Ctrl-P`; Enter app
 
 Themes come from [`ratatui-themes`](https://docs.rs/ratatui-themes/latest/ratatui_themes/), including Dracula (the default), Nord, Catppuccin, Gruvbox, Tokyo Night, and Solarized. Run `rsdup --list-themes` for the full catalog; this does not scan files or contact Ollama. Choose with `--theme NAME`, or press `t` while browsing to open the theme picker. Type to filter by name and move with arrows or `Ctrl-N`/`Ctrl-P`. Each selection previews immediately across the interface, including syntax highlighting, with the code still visible behind a lightly dimmed modal background. Enter keeps the preview; Esc restores the original theme, marked with `*` in the list. The active theme appears in the header. Palettes apply throughout the browser, including syntax highlighting, dimmed context, and diff tints. Switching preserves your selection and scroll position and recolors cached source without rereading files or requesting embeddings. Theme changes are session-only; pass `--theme` again to reuse a favorite. This option only affects the interactive view, not text or JSON reports.
 
+Press `y` to copy a location such as `src/parser.rs:42`. The path is relative to the working directory; the line is the focused occurrence’s starting line, unchanged by scrolling. Copying uses [`arboard`](https://docs.rs/arboard/) on macOS, Windows, and Linux (X11 and supported Wayland compositors), without external clipboard commands. If no clipboard is available, the interface reports the failure. On Linux, clipboard contents may stop being available after rsdup exits unless a clipboard manager retains them.
+
 Editor selection uses `--editor`, then `VISUAL`, then `EDITOR`, falling back to `zed`. Zed, VS Code/Code Insiders/VSCodium, Vim/Neovim/Vi, Emacs/emacsclient, and Nano receive the source location; other executables receive the file path only. Commands support quoted arguments but are executed directly, without shell expansion. Use an editor-specific wait option if you want the browser to wait for a GUI editing session. Terminal editors temporarily take over the terminal; the browser resumes afterward, including after launch failures.
 
 Scanning completes before the browser opens. Browsing makes no embedding requests, shares cached source and highlighting across occurrences from the same file, and redraws only for input or resize events. Use `--embedding-cache target/rsdup-embeddings` to speed up subsequent semantic scans. The browser requires terminal input/output and at least 60 columns by 12 rows; a taller terminal shows two snippets at once. It cannot be combined with `--quiet` or JSON output.
 
-This is a read-only snapshot, not a live editor. Both syntax and semantic snippets retain the scanned match. Context is loaded once when the browser opens and is only shown if the matched text still agrees with the scan. Missing or changed matches, unreadable files, and files over the 2 MiB context limit fall back to the scanned snippet with a warning. Edits made while browsing do not update matches or locations: rerun the scan after refactoring.
+The displayed code comes from the scan. Context is loaded once when the browser opens and is only shown if the matched text still agrees with the scan. Missing or changed matches, unreadable files, and files over the 2 MiB context limit fall back to the scanned snippet with a warning. Edits made while browsing do not update matches or locations: rerun the scan after refactoring.
 
 ### Sorting (syntax modes only)
 
@@ -123,15 +127,23 @@ Every syntax sort order uses deterministic secondary keys, so repeated runs prod
 
 ## Semantic similarity (default)
 
-`--mode semantic` compares function, closure, and async-block bodies with an installed **local Ollama** embedding model. It is independent of the syntax detector: changed calls, inserted setup steps, and different types can still produce a useful comparison. A high score is not proof of equivalent behavior or a recommendation to extract a helper.
+`--mode semantic` compares function, closure, and async-block bodies using **local embeddings**, via Ollama or FastEmbed. It is independent of the syntax detector: changed calls, inserted setup steps, and different types can still produce a useful comparison. A high score is not proof of equivalent behavior or a recommendation to extract a helper.
 
 ```console
 rsdup . --mode semantic
+rsdup . --embedding-backend fastembed
+rsdup . --embedding-backend ollama
 rsdup . --mode semantic --embedding-model unclemusclez/jina-embeddings-v2-base-code --embedding-cache target/rsdup-embeddings --format json
 rsdup . --mode semantic --embedding-model unclemusclez/jina-embeddings-v2-base-code --similarity-threshold 0.95 --max-body-chars 6000 --view syntax
 ```
 
-Start Ollama and install your chosen embedding model separately. When exactly one installed model supports embeddings, rsdup selects it automatically and prints its name. If several do, rsdup lists them and asks you to choose with `--embedding-model`; chat-only models are not selected. rsdup only connects to `http://localhost:11434`; it disables proxies and redirects and never downloads a model or calls a hosted embedding API. There are no model calls in `near-miss` or `exact` mode. Semantic scans use CPU/GPU resources on the Ollama server. Keep the model tag unchanged during a scan: rsdup checks its digest before and after uncached requests and before publishing the report.
+The default `--embedding-backend auto` probes Ollama with a three-second discovery budget. A usable single embedding model is selected without a prompt; missing, unreachable, or ambiguous models lead to a backend choice. Explicit `--embedding-model` implies Ollama and cannot be combined with FastEmbed. Backend failures during a scan abort rather than silently switching models.
+
+**Ollama:** start the service and install your chosen model separately, for example `ollama pull unclemusclez/jina-embeddings-v2-base-code`. rsdup never installs or starts Ollama or pulls its models. Chat-only models are not selected. Ollama requests go only to `http://localhost:11434`, with proxies and redirects disabled. Keep the model tag unchanged during a scan: rsdup checks its digest before and after uncached requests and before publishing the report.
+
+**FastEmbed:** CPU inference uses a pinned, hash-verified revision of `jinaai/jina-embeddings-v2-base-code`. Selecting this backend downloads missing public model/tokenizer files from Hugging Face; embedding inputs are never uploaded. Model files are reused from the OS user cache under `rsdup/fastembed`; set `FASTEMBED_CACHE_DIR` to override this location. Cached model files permit offline inference. Inputs above 8,192 tokens are rejected rather than truncated. No server or external executable is required. The Rust build includes ONNX Runtime, whose build may download a native runtime artifact.
+
+Neither syntax mode loads a model. In our single-pass M1 Max test, uncached CPU embedding took about 160 seconds versus 26 seconds with GPU-backed Ollama; matches were nearly identical, with one borderline pair crossing the default threshold. These are not universal performance guarantees.
 
 ### Extraction and evidence
 
@@ -150,9 +162,9 @@ The default semantic summary shows numbered groups, function names, test markers
 
 All eligible pairs are compared by raw cosine similarity (default threshold: `0.93`). Invalid, zero, nonfinite, or inconsistent-dimension vectors fail the scan. Same-file overlapping bodies cannot form an edge. Within each connected component, overlapping members are removed deterministically by strongest incident edge, token count, then identity; components are then rebuilt from the surviving edges. A chain A–B–C does **not** imply an A–C match. The JSON retains all eligible units, including isolated and overlap-suppressed units.
 
-Semantic JSON has its own schema (`mode: "semantic"`, `schema_version: 1`), leaving syntax JSON version 2 unchanged. It includes extraction/filtering policy, model digest/dimensions, source context, one-based start and exclusive end positions, literal-sensitive identities, input digests, and supporting edges. Edge endpoints and group members index the top-level `units` array. Group IDs depend on retained body identities, paths, kinds, and multiplicity—not source line numbers or similarity scores. Groups are deterministically ordered by source traversal, not by refactoring value.
+Semantic JSON has its own schema (`mode: "semantic"`, `schema_version: 1`), leaving syntax JSON version 2 unchanged. It includes extraction/filtering policy, backend-specific model provenance and dimensions, source context, one-based start and exclusive end positions, literal-sensitive identities, input digests, and supporting edges. Edge endpoints and group members index the top-level `units` array. Group IDs depend on retained body identities, paths, kinds, and multiplicity—not source line numbers or similarity scores. Groups are deterministically ordered by source traversal, not by refactoring value.
 
-`--embedding-cache DIR` opts into persistent caching. Entries are keyed by exact input, provider/model identity and digest, and cache-policy version; no source text is stored. Writes are atomic, invalid entries cause actionable errors, and successful requests survive an interrupted scan. Cached vectors can still be sensitive derived data: keep them private. Reports contain original source, so keep reports private too. Neither needs to be committed. Ollama must remain available even on a cache-only run to verify model identity.
+`--embedding-cache DIR` opts into persistent caching. Entries are keyed by exact input, provider/model identity and digest, and cache-policy version; no source text is stored. Writes are atomic, invalid entries cause actionable errors, and successful requests survive an interrupted scan. Cached vectors can still be sensitive derived data: keep them private. Reports contain original source, so keep reports private too. Neither needs to be committed. Ollama must remain available even on a cache-only run to verify model identity. FastEmbed uses a separate `fastembed-v1` result-cache namespace keyed by verified model artifacts and inference settings; it still loads the local model on cached scans. Model-file caching is automatic, but embedding-result caching remains opt-in for both backends.
 
 Comparison time is quadratic in eligible occurrences; memory holds vectors plus accepted edges, not a dense similarity matrix. Narrow scan paths, use exclusions, or raise size thresholds for very large repositories. Results depend on the model and extraction policy; a score or cluster count is not a portable golden test. Offline tests use synthetic bodies and vectors rather than customer code or a live model.
 

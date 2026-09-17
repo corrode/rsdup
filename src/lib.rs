@@ -1,5 +1,6 @@
 mod detect;
 mod discover;
+pub mod local_embedding;
 mod model;
 pub mod ollama;
 pub mod semantic;

@@ -1,4 +1,6 @@
+mod clipboard;
 mod editor;
+mod embedding_backend;
 mod snippet_diff;
 mod theme;
 mod tui;
@@ -27,7 +29,7 @@ use rsdup::{
     name = "rsdup",
     version,
     about = "Find similar and duplicated Rust code",
-    after_help = "Choosing a mode:\n  semantic (default)  Broad similarity review; requires local Ollama embeddings.\n  near-miss           Offline, repeatable syntax checks; good for CI.\n  exact               Tightest syntax matches; add --profile strict to keep names/literals.\n\nStart with: rsdup .\nNo Ollama?  rsdup . --mode near-miss\nTests are excluded by default. Similarity is not proof of equivalent behavior."
+    after_help = "Choosing a mode:\n  semantic (default)  Broad similarity review; uses FastEmbed or local Ollama embeddings.\n  near-miss           Offline, repeatable syntax checks; good for CI.\n  exact               Tightest syntax matches; add --profile strict to keep names/literals.\n\nStart with: rsdup .\nNo server? rsdup . --embedding-backend fastembed (~642 MB first download)\nNo model?  rsdup . --mode near-miss\nTests are excluded by default."
 )]
 struct Cli {
     /// Files or directories to scan. Defaults to the current directory.
@@ -54,7 +56,11 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_parser = positive_usize, conflicts_with = "embedding_model")]
     max_holes: usize,
 
-    /// Local Ollama embedding model; auto-selected when exactly one is installed.
+    /// Semantic mode backend; auto uses Ollama if available, otherwise asks (not saved).
+    #[arg(long, value_enum, default_value_t = embedding_backend::Backend::Auto)]
+    embedding_backend: embedding_backend::Backend,
+
+    /// Select an installed Ollama model (implies Ollama; conflicts with fastembed).
     #[arg(long)]
     embedding_model: Option<String>,
 
@@ -86,7 +92,7 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     theme: Option<theme::ThemeName>,
 
-    /// List available TUI themes without scanning or connecting to Ollama.
+    /// List available TUI themes without scanning or loading an embedding model.
     #[arg(long, exclusive = true)]
     list_themes: bool,
 
@@ -114,7 +120,7 @@ struct Cli {
     #[arg(long)]
     fail_on_duplicates: bool,
 
-    /// Suppress normal report output.
+    /// Suppress normal report output, backend notices, and interactive prompts.
     #[arg(short, long)]
     quiet: bool,
 }
@@ -132,7 +138,7 @@ enum ModeArg {
     Exact,
     /// Offline syntax clones with limited expression differences; useful for CI.
     NearMiss,
-    /// Broader, model-dependent similarity candidates via local Ollama embeddings.
+    /// Broader, model-dependent similarity candidates via FastEmbed or local Ollama.
     #[default]
     Semantic,
 }
@@ -252,13 +258,8 @@ fn run() -> Result<ExitCode> {
     let report = scan(&cli.paths, &options, &discover_options)?;
 
     if cli.view == View::Interactive {
-        let mode = if matches!(cli.mode, ModeArg::Exact) {
-            "exact"
-        } else {
-            "near-miss"
-        };
         tui::run(
-            tui_data::syntax(&report, mode),
+            tui_data::syntax(&report),
             cli.editor.as_deref(),
             cli.theme.unwrap_or_default(),
         )?;
@@ -317,6 +318,21 @@ fn validate_interactive(cli: &Cli) -> Result<()> {
 }
 
 fn validate_mode_options(cli: &Cli, matches: &clap::ArgMatches) -> Result<()> {
+    cli.embedding_backend
+        .with_model(cli.embedding_model.as_deref())?;
+    if !matches!(cli.mode, ModeArg::Semantic) {
+        for name in [
+            "embedding_backend",
+            "embedding_model",
+            "similarity_threshold",
+            "embedding_cache",
+            "max_body_chars",
+        ] {
+            if matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine) {
+                bail!("--{} requires --mode semantic", name.replace('_', "-"));
+            }
+        }
+    }
     if matches!(cli.mode, ModeArg::Semantic) {
         for name in ["profile", "max_holes", "sort"] {
             if matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine) {
@@ -331,7 +347,7 @@ fn validate_mode_options(cli: &Cli, matches: &clap::ArgMatches) -> Result<()> {
 }
 
 fn run_semantic(cli: &Cli) -> Result<ExitCode> {
-    use rsdup::{ollama::OllamaEmbedder, semantic::SemanticOptions};
+    use rsdup::semantic::SemanticOptions;
 
     let defaults = SemanticOptions::default();
     let options = SemanticOptions {
@@ -346,14 +362,12 @@ fn run_semantic(cli: &Cli) -> Result<ExitCode> {
         no_ignore: cli.no_ignore,
         excludes: cli.exclude.clone(),
     };
-    let mut embedder = match cli.embedding_model.as_deref() {
-        Some(model) => OllamaEmbedder::new(model, cli.embedding_cache.clone()),
-        None => OllamaEmbedder::auto(cli.embedding_cache.clone()),
-    }
-    .context("semantic mode needs a local Ollama embedding model; for an offline syntax scan, use --mode near-miss")?;
-    if !cli.quiet {
-        eprintln!("Using local embedding model: {}", embedder.metadata().model);
-    }
+    let mut embedder = embedding_backend::BackendEmbedder::new(
+        cli.embedding_backend,
+        cli.embedding_model.as_deref(),
+        cli.embedding_cache.clone(),
+        cli.quiet,
+    )?;
     let report = rsdup::scan_semantic(&cli.paths, &options, &discovery, &mut embedder)?;
     embedder.verify_model()?;
     if cli.view == View::Interactive {
@@ -372,7 +386,7 @@ fn run_semantic(cli: &Cli) -> Result<ExitCode> {
                 struct Output<'a> {
                     #[serde(flatten)]
                     report: &'a rsdup::semantic::SemanticReport,
-                    embedding: rsdup::ollama::OllamaMetadata,
+                    embedding: embedding_backend::Metadata,
                 }
                 serde_json::to_writer_pretty(
                     &mut output,
@@ -677,6 +691,16 @@ mod tests {
     use rsdup::semantic::{self, Embedder, SemanticOptions, SemanticReport};
 
     use super::{Cli, ModeArg, View, highlight_rust, print_semantic, print_text, semantic_name};
+
+    #[test]
+    fn help_keeps_mode_guidance_without_trailing_disclaimer() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Choosing a mode:"));
+        assert!(help.contains("Tests are excluded by default."));
+        assert!(!help.contains("Similarity is not proof of equivalent behavior."));
+    }
 
     struct SyntheticEmbedder;
 
@@ -1075,7 +1099,8 @@ mod tests {
             let help = help.to_string();
             assert!(help.contains("[default: semantic]"));
             assert!(help.contains("Choosing a mode:"));
-            assert!(help.contains("requires local Ollama embeddings"));
+            assert!(help.contains("uses FastEmbed or local Ollama embeddings"));
+            assert!(help.contains("--embedding-backend"));
             assert!(help.contains("good for CI"));
             assert!(help.contains("--mode near-miss"));
             assert!(help.contains("--profile strict"));
@@ -1200,6 +1225,47 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn backend_options_are_validated_before_loading_models() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        for mode in ["exact", "near-miss"] {
+            for backend in ["auto", "fastembed", "ollama"] {
+                let matches = Cli::command()
+                    .try_get_matches_from(["rsdup", "--mode", mode, "--embedding-backend", backend])
+                    .unwrap();
+                let cli = Cli::from_arg_matches(&matches).unwrap();
+                assert!(
+                    super::validate_mode_options(&cli, &matches)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("--embedding-backend requires --mode semantic")
+                );
+            }
+        }
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "rsdup",
+                "--embedding-backend",
+                "fastembed",
+                "--embedding-model",
+                "local-code",
+            ])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert!(
+            super::validate_mode_options(&cli, &matches)
+                .unwrap_err()
+                .to_string()
+                .contains("remove --embedding-model")
+        );
+        assert_eq!(
+            Cli::try_parse_from(["rsdup"]).unwrap().embedding_backend,
+            crate::embedding_backend::Backend::Auto
+        );
+        assert!(Cli::try_parse_from(["rsdup", "--embedding-backend", "unknown"]).is_err());
     }
 
     #[test]
