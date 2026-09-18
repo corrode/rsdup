@@ -27,6 +27,7 @@ use ratatui::{
 };
 
 use crate::{
+    config::Settings,
     snippet_diff::{LineChange, SnippetDiff},
     theme::{Theme, ThemeName},
     tui_data::{BrowserReport, Snippet},
@@ -34,14 +35,21 @@ use crate::{
 
 type Highlighted = Vec<Line<'static>>;
 
-/// Browse cached source context without reading files or modifying the report.
-pub(crate) fn run(report: BrowserReport, editor: Option<&str>, theme: ThemeName) -> Result<()> {
+/// Browse cached source context without rereading source files or modifying the report.
+pub(crate) fn run(
+    report: BrowserReport,
+    editor: Option<&str>,
+    theme: Option<ThemeName>,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
             "rsdup requires an interactive terminal on stdin and stdout; run without piping or redirection, or use a non-interactive output mode"
         );
     }
-    let mut app = App::new(report, theme);
+    let config_path = crate::config::path()?;
+    let settings = Settings::load(&config_path)?;
+    let editor = editor.or(settings.editor.as_deref()).map(str::to_owned);
+    let mut app = App::with_settings(report, settings, theme);
 
     // Restore before the normal panic diagnostic is printed. Catching the unwind lets
     // us put back the *original* hook outside an unwinding thread, even on setup failure.
@@ -53,7 +61,9 @@ pub(crate) fn run(report: BrowserReport, editor: Option<&str>, theme: ThemeName)
             hook(info);
         }
     }));
-    let result = panic::catch_unwind(AssertUnwindSafe(|| run_terminal(&mut app, editor)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        run_terminal(&mut app, editor.as_deref(), &config_path)
+    }));
     if let Some(hook) = previous.lock().unwrap_or_else(|e| e.into_inner()).take() {
         panic::set_hook(hook);
     }
@@ -110,7 +120,7 @@ impl Drop for Session {
     }
 }
 
-fn run_terminal(app: &mut App, editor: Option<&str>) -> Result<()> {
+fn run_terminal(app: &mut App, editor: Option<&str>, config_path: &Path) -> Result<()> {
     let mut session = Session::default();
     session.enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -129,6 +139,12 @@ fn run_terminal(app: &mut App, editor: Option<&str>) -> Result<()> {
         match action {
             Action::Quit => break,
             Action::Draw => {}
+            Action::SaveSettings => {
+                app.status = Some(match app.settings.save(config_path) {
+                    Ok(()) => (false, "Settings saved".into()),
+                    Err(error) => (true, format!("Settings: {error:#}")),
+                });
+            }
             Action::Copy => app.copy_with(|text| clipboard.copy(text)),
             Action::Open => {
                 if let Some(snippet) = app.snippet() {
@@ -190,6 +206,7 @@ enum Focus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Draw,
+    SaveSettings,
     Open,
     Copy,
     Quit,
@@ -275,8 +292,9 @@ impl ThemePicker {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GroupSort {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GroupSort {
     Occurrences,
     Lines,
     Files,
@@ -304,6 +322,7 @@ struct GroupMetadata {
 }
 
 struct App {
+    settings: Settings,
     theme_name: ThemeName,
     theme_picker: Option<ThemePicker>,
     theme: Theme,
@@ -333,7 +352,13 @@ struct App {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(report: BrowserReport, theme_name: ThemeName) -> Self {
+        Self::with_settings(report, Settings::default(), Some(theme_name))
+    }
+
+    fn with_settings(report: BrowserReport, settings: Settings, theme: Option<ThemeName>) -> Self {
+        let theme_name = theme.unwrap_or(settings.theme);
         let theme = Theme::new(theme_name);
         let highlighted = highlight_report(&report, &theme);
         let search_text = report
@@ -378,13 +403,14 @@ impl App {
             theme_name,
             theme_picker: None,
             theme,
-            diff_enabled: true,
+            diff_enabled: settings.diff_enabled,
             pair_diff: None,
             report,
             highlighted,
             search_text,
             metadata,
-            sort: GroupSort::Occurrences,
+            sort: settings.sort,
+            settings,
             sort_picker: None,
 
             visible,
@@ -571,6 +597,8 @@ impl App {
                 KeyCode::Enter => {
                     if picker.list.selected().is_some() {
                         self.theme_picker = None;
+                        self.settings.theme = self.theme_name;
+                        return Action::SaveSettings;
                     }
                 }
                 _ => {
@@ -588,6 +616,8 @@ impl App {
                 KeyCode::Enter => {
                     self.apply_sort(GroupSort::ALL[selected]);
                     self.sort_picker = None;
+                    self.settings.sort = self.sort;
+                    return Action::SaveSettings;
                 }
                 KeyCode::Down => self.sort_picker = Some((selected + 1).min(3)),
                 KeyCode::Up => self.sort_picker = Some(selected.saturating_sub(1)),
@@ -655,7 +685,11 @@ impl App {
                 self.sort_picker = GroupSort::ALL.iter().position(|&s| s == self.sort)
             }
 
-            KeyCode::Char('d') => self.diff_enabled = !self.diff_enabled,
+            KeyCode::Char('d') => {
+                self.diff_enabled = !self.diff_enabled;
+                self.settings.diff_enabled = self.diff_enabled;
+                return Action::SaveSettings;
+            }
             KeyCode::Char('t') => {
                 self.theme_picker = Some(ThemePicker::new(self.theme_name, &self.highlighted));
             }
@@ -1795,6 +1829,64 @@ mod tests {
     use crate::tui_data::{MatchGroup, PairEvidence};
     use ratatui::{backend::TestBackend, style::Color};
     use std::path::PathBuf;
+
+    #[test]
+    fn saved_preferences_initialize_browser_and_cli_theme_is_temporary() {
+        let settings = Settings {
+            theme: ThemeName::Nord,
+            diff_enabled: false,
+            sort: GroupSort::Path,
+            editor: Some("zed --wait".into()),
+        };
+        let app = App::with_settings(context_report(), settings.clone(), None);
+        assert_eq!(app.theme_name, ThemeName::Nord);
+        assert!(!app.diff_enabled);
+        assert_eq!(app.sort, GroupSort::Path);
+
+        let mut app =
+            App::with_settings(context_report(), settings.clone(), Some(ThemeName::Dracula));
+        assert_eq!(app.theme_name, ThemeName::Dracula);
+        assert_eq!(app.settings, settings);
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Action::SaveSettings
+        );
+        assert!(app.settings.diff_enabled);
+        assert_eq!(app.settings.theme, ThemeName::Nord);
+        assert_eq!(app.settings.editor, settings.editor);
+    }
+
+    #[test]
+    fn only_confirmed_picker_changes_are_saved() {
+        let mut app = App::new(context_report(), ThemeName::Dracula);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.key(key(KeyCode::Char('t')));
+        app.key(key(KeyCode::Down));
+        assert_ne!(app.theme_name, ThemeName::Dracula);
+        assert_eq!(app.settings.theme, ThemeName::Dracula);
+        assert_eq!(app.key(key(KeyCode::Esc)), Action::Draw);
+        assert_eq!(app.settings.theme, ThemeName::Dracula);
+
+        app.key(key(KeyCode::Char('t')));
+        app.key(key(KeyCode::Down));
+        let preview = app.theme_name;
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        );
+        assert_eq!(app.settings.theme, ThemeName::Dracula);
+        assert_eq!(app.key(key(KeyCode::Enter)), Action::SaveSettings);
+        assert_eq!(app.settings.theme, preview);
+
+        app.key(key(KeyCode::Char('s')));
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.key(key(KeyCode::Esc)), Action::Draw);
+        assert_eq!(app.settings.sort, GroupSort::Occurrences);
+        app.key(key(KeyCode::Char('s')));
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.key(key(KeyCode::Enter)), Action::SaveSettings);
+        assert_eq!(app.settings.sort, GroupSort::Lines);
+    }
 
     fn dracula() -> Theme {
         Theme::new(ThemeName::Dracula)

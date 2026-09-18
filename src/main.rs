@@ -1,4 +1,5 @@
 mod clipboard;
+mod config;
 mod editor;
 mod embedding_backend;
 mod snippet_diff;
@@ -84,17 +85,21 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = View::Summary)]
     view: View,
 
-    /// Editor command for the interactive browser (then VISUAL, EDITOR, or zed).
+    /// Editor command for the browser (then config, VISUAL, EDITOR, or zed).
     #[arg(long, value_name = "COMMAND")]
     editor: Option<String>,
 
-    /// TUI color theme (default: dracula). See --list-themes; t opens the theme picker.
+    /// TUI color theme (overrides saved theme). See --list-themes; t opens the picker.
     #[arg(long, value_name = "NAME")]
     theme: Option<theme::ThemeName>,
 
     /// List available TUI themes without scanning or loading an embedding model.
     #[arg(long, exclusive = true)]
     list_themes: bool,
+
+    /// Print the user config path without scanning or creating the file.
+    #[arg(long, exclusive = true)]
+    config_path: bool,
 
     /// Syntax modes only: how duplicate classes are ordered.
     #[arg(long, value_enum, default_value_t = SortArg::Occurrences, conflicts_with = "embedding_model")]
@@ -203,6 +208,10 @@ fn run() -> Result<ExitCode> {
         print_themes(io::stdout().lock())?;
         return Ok(ExitCode::SUCCESS);
     }
+    if cli.config_path {
+        writeln!(io::stdout().lock(), "{}", config::path()?.display())?;
+        return Ok(ExitCode::SUCCESS);
+    }
     validate_mode_options(&cli, &matches)?;
     if cli.quiet && matches!(cli.format, Format::Json) {
         bail!("--quiet cannot be combined with --format json");
@@ -258,11 +267,7 @@ fn run() -> Result<ExitCode> {
     let report = scan(&cli.paths, &options, &discover_options)?;
 
     if cli.view == View::Interactive {
-        tui::run(
-            tui_data::syntax(&report),
-            cli.editor.as_deref(),
-            cli.theme.unwrap_or_default(),
-        )?;
+        tui::run(tui_data::syntax(&report), cli.editor.as_deref(), cli.theme)?;
     } else if !cli.quiet {
         let stdout = io::stdout();
         let colored_output = stdout.is_terminal();
@@ -374,7 +379,7 @@ fn run_semantic(cli: &Cli) -> Result<ExitCode> {
         tui::run(
             tui_data::semantic(&report),
             cli.editor.as_deref(),
-            cli.theme.unwrap_or_default(),
+            cli.theme,
         )?;
     } else if !cli.quiet {
         let stdout = io::stdout();
